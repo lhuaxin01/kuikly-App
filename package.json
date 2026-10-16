@@ -1,0 +1,9 @@
+{
+  "name": "navi-app",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test:navigation": "powershell -File scripts/test-navigation.ps1",
+    "build:harmony": "powershell -File scripts/build-harmony.ps1"
+  }
+}

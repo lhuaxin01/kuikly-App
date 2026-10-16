@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Map and navigation"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Location, route planning and foreground navigation"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Navigation"
+    }
+  ]
+}

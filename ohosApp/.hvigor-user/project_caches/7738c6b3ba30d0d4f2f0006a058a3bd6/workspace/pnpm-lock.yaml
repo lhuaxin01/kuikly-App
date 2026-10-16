@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      kuikly-ohos-compile-plugin:
+        specifier: 0.0.1-alpha.4
+        version: 0.0.1-alpha.4
+
+packages:
+
+  kuikly-ohos-compile-plugin@0.0.1-alpha.4:
+    resolution: {integrity: sha512-fhVCSN/Me5JsMPL2SHTBr3HJU/TNDQBm5dpcDr1qu1YolHLY6DWBZp0G0XrCKSy1lb4bpEd+lJwMD2Qy1lkHDQ==}
+
+snapshots:
+
+  kuikly-ohos-compile-plugin@0.0.1-alpha.4: {}

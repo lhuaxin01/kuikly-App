@@ -1,0 +1,67 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\23575\\.ohos\\config\\default_ohosApp_uWRcsbfoRbr3iSda53gs6cC4hSIZKo7ZUAc8Mqcr0pw=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BB5006AEEE0CABB60E0EB59B5494AAB06DCD1FB44DA0B621A1E96B4B3C72BAC57FA18975C6AD512",
+          "profile": "C:\\Users\\23575\\.ohos\\config\\default_ohosApp_uWRcsbfoRbr3iSda53gs6cC4hSIZKo7ZUAc8Mqcr0pw=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\23575\\.ohos\\config\\default_ohosApp_uWRcsbfoRbr3iSda53gs6cC4hSIZKo7ZUAc8Mqcr0pw=.p12",
+          "storePassword": "0000001BC6BF6BFA747F59CE6237E139B14F7125831B26650F275D392F22AD0E0542BFD81064E1F3FB9836"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS",
+        //        "buildOption": {
+        //          "strictMode": {
+        //            "useNormalizedOHMUrl": true
+        //          },
+        //          "externalNativeOptions": {
+        //            "path": "./src/main/cpp/CMakeLists.txt",
+        //            "abiFilters": [
+        //              "arm64-v8a",
+        //              "x86_64"
+        //            ]
+        //          }
+        //        }
+        "buildOption": {
+          "strictMode": {
+            "useNormalizedOHMUrl": true
+          }
+        },
+        //        "targetSdkVersion": "26.0.0"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

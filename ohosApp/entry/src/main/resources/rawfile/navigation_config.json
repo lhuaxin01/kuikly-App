@@ -1,0 +1,12 @@
+{
+  "amapHarmonyApiKey": "537e33c1fbb0ee50ef02e8b8259b9cc5",
+  "naviClawWebSocketUrl": "ws://10.101.20.172:12345/ws",
+  "naviClawLoginPath": "/auth/login",
+  "naviClawRegisterPath": "/auth/register",
+  "naviClawChannelId": "navigation-app",
+  "fixedDestination": {
+    "name": "北京大学（示例终点，可修改）",
+    "latitude": 39.992873,
+    "longitude": 116.310918
+  }
+}
