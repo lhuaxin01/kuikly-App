@@ -20,6 +20,7 @@
 .\scripts\test-navigation.ps1
 .\scripts\test-amap-adapter.ps1
 .\scripts\test-navigation-agent-bridge.ps1
+.\scripts\test-navigation-voice.ps1
 .\scripts\test-shared-navigation.ps1
 .\scripts\verify-navigation-layout.ps1
 .\scripts\build-harmony.ps1
@@ -32,6 +33,8 @@
 `test-shared-offline.ps1` 可使用本机已有的精确版本 JVM 依赖，离线编译共享页面/桥接并执行业务测试；它不替代 Kotlin Native 和鸿蒙编译。
 
 ## 当前阶段
+
+2026-10-16 多地点与语音输入：途经点由 Agent 提供，按行程顺序逐次确认候选，页面显示已确认地点和剩余候选组；移除鸿蒙独有的导航处理 30 秒截止，连接和发送失败仍单独处理。语音按钮区分准备与真正聆听，未手改的录音文本点击发送会等待最终纠错，已手改的文字可直接确认发送；边说边改保护修改区域并接续口述，成功结束只发送一次且保留输入。增加结构化地名热词、录音时序及音量诊断，未确认的临时结果保留为草稿。详见 [多地点能力分析与语音接入](docs/multistop-voice-input.md)。
 
 2026-10-13 导航交互优化：实时导航使用街道级镜头跟随当前位置和可靠的行进方向，静止时保持方向稳定，路线全览北向上；支持“路线全览/跟随当前位置”切换。“退出导航”和首次系统返回保留当前路线，可重新选择真实/模拟导航。目的地解析、定位、算路、启动导航期间在输入栏位置显示一行进度和取消入口，保留地图浏览并阻止重复提交。详见 [导航跟随、返回预览与加载状态](docs/guidance-preview-loading.md)。
 

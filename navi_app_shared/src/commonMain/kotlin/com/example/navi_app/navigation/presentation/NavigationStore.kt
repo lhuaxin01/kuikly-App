@@ -10,7 +10,6 @@ enum class PendingNavigationCommand { NONE, OPEN, LOCATE, PLAN, START, EXIT_GUID
 data class NavigationUiState(
     val runtime: RuntimeSnapshot = RuntimeSnapshot(),
     val draft: NavigationDraft = NavigationDraft(),
-    val selectingWaypoint: Boolean = false,
     val notice: String = "",
     val draftRevision: Int = 0,
     val environment: NavigationEnvironment? = null,
@@ -21,6 +20,8 @@ data class NavigationUiState(
     val candidateGroup: CandidateGroup? = null,
     val candidateQuestion: String = "",
     val candidateTravelMode: String? = null,
+    val candidateTask: NavigationTask? = null,
+    val candidateGroups: List<CandidateGroup> = emptyList(),
     /** Cover the asynchronous bridge gap before the platform publishes its phase. */
     val pendingCommand: PendingNavigationCommand = PendingNavigationCommand.NONE,
     val preparingRoute: Boolean = false,
@@ -38,20 +39,22 @@ data class NavigationUiState(
         else -> ""
     }
     val busy get() = busyMessage.isNotEmpty()
-    val canSubmit get() = !busy && runtime.phase != EnginePhase.DISPOSED
+    /** Sending while dictating first hands input ownership back from the voice coordinator. */
+    val canSendInput get() = !busy && runtime.phase != EnginePhase.DISPOSED
+    val canSubmit get() = canSendInput && !shell.input.voiceActive
     val mode get() = when (runtime.phase) {
         EnginePhase.NAVIGATING, EnginePhase.STARTING -> MapMode.GUIDANCE
         EnginePhase.ROUTE_READY -> MapMode.ROUTE_PREVIEW
         else -> MapMode.MAP
     }
     val canOpen get() = runtime.phase in setOf(EnginePhase.IDLE, EnginePhase.ERROR, EnginePhase.STOPPED, EnginePhase.ARRIVED)
-    val canLocate get() = !busy && runtime.phase in setOf(EnginePhase.MAP_READY, EnginePhase.LOCATION_READY, EnginePhase.ROUTE_READY,
+    val canLocate get() = !busy && !shell.input.voiceActive && runtime.phase in setOf(EnginePhase.MAP_READY, EnginePhase.LOCATION_READY, EnginePhase.ROUTE_READY,
         EnginePhase.STOPPED, EnginePhase.ARRIVED)
-    val canEdit get() = (canOpen || canLocate) && !busy
+    val canEdit get() = (canOpen || canLocate) && !busy && !shell.input.voiceActive
     val canPlan get() = runtime.phase in setOf(EnginePhase.LOCATION_READY, EnginePhase.ROUTE_READY) &&
-        draft.destination != null && !resolvingDestination && !busy
+        draft.destination != null && !resolvingDestination && !busy && !shell.input.voiceActive
     val canStart get() = runtime.phase == EnginePhase.ROUTE_READY && runtime.route != null &&
-        draft.destination != null && runtime.routeRevision == draftRevision && !resolvingDestination && !busy
+        draft.destination != null && runtime.routeRevision == draftRevision && !resolvingDestination && !busy && !shell.input.voiceActive
     val canExitGuidance get() = mode == MapMode.GUIDANCE && runtime.route != null && !busy
 }
 
@@ -112,7 +115,7 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
         if (snapshot.phase == EnginePhase.STOPPED) {
             replacementDraft?.let { draft ->
                 replacementDraft = null
-                changeDraft(draft, schedulePlan = true)
+                changeDraft(draft, schedulePlan = true, preserveInput = true)
                 open()
                 return
             }
@@ -156,6 +159,7 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
         pendingRoutePlan = false
         replacementDraft = null
         update(state.copy(resolvingDestination = true, preparingRoute = false, candidateGroup = null, candidateQuestion = "", candidateTravelMode = null,
+            candidateTask = null, candidateGroups = emptyList(),
             notice = "正在识别目的地，请等待地点确认后规划路线"))
     }
     /** MapTemplate sends modify_task only during guidance, with the live origin. */
@@ -205,14 +209,9 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
     fun selectPoint(point: GeoPoint) {
         if (!state.canEdit || !point.isValid()) return
         try {
-            val draft = if (state.selectingWaypoint) state.draft.withWaypoint(Place("途经点 ${state.draft.waypoints.size + 1}", point),
-                state.environment?.capabilities?.maxWaypoints ?: 0)
-            else state.draft.withDestination(Place("地图选定的目的地", point))
-            changeDraft(draft, confirmsDestination = !state.selectingWaypoint)
+            changeDraft(state.draft.withDestination(Place("地图选定的目的地", point)))
         } catch (error: IllegalArgumentException) { message(error.message ?: "地点无效") }
     }
-    fun toggleWaypoint() { if (state.canEdit) update(state.copy(selectingWaypoint = !state.selectingWaypoint, notice = "")) }
-    fun clearWaypoints() { if (state.canEdit) changeDraft(state.draft.copy(waypoints = emptyList()), confirmsDestination = false) }
     fun selectTravelMode(mode: TravelMode) {
         if (!state.canEdit || mode == state.draft.travelMode) return
         changeDraft(state.draft.copy(travelMode = mode), schedulePlan = state.runtime.route != null, confirmsDestination = false)
@@ -244,21 +243,28 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
     }
     fun stop() {
         pendingRoutePlan = false; replacementDraft = null
-        update(state.copy(selectingWaypoint = false, overview = false, preparingRoute = false, pendingCommand = PendingNavigationCommand.NONE,
+        update(state.copy(overview = false, preparingRoute = false, pendingCommand = PendingNavigationCommand.NONE,
             shell = state.shell.copy(input = state.shell.input.copy(submitting = false, analyzing = false)),
-            candidateGroup = null, candidateQuestion = "", notice = ""))
+            candidateGroup = null, candidateQuestion = "", candidateTravelMode = null,
+            candidateTask = null, candidateGroups = emptyList(), notice = ""))
         port.stop()
     }
-    fun chooseCandidate(candidate: Candidate) {
+    fun chooseCandidate(candidate: Candidate, expectedGroupId: String? = null) {
         val group = state.candidateGroup ?: return
-        if (state.busy) return
+        if (state.busy || state.shell.input.voiceActive) return
+        // A queued click from an older card must never select an item in the next group.
+        if (expectedGroupId != null && group.id != expectedGroupId) return
+        if (candidate !in group.candidates) return
         if (candidate.id.isBlank()) { message("候选地点标识缺失"); return }
-        update(state.copy(candidateGroup = null, candidateQuestion = "", notice = "正在确认候选地点"))
+        // Keep the server snapshot until its response replaces it. Network errors can
+        // then unlock this same card instead of losing the remaining itinerary.
+        update(state.copy(shell = state.shell.copy(input = state.shell.input.copy(
+            submitting = true, analyzing = false, error = "")), notice = ""))
         try {
             candidateSelectionHandler(group.id, candidate.id)
         } catch (error: Throwable) {
             setInputError(error.message ?: "候选地点确认失败")
-            update(state.copy(candidateGroup = group, notice = error.message ?: "候选地点确认失败"))
+            message(error.message ?: "候选地点确认失败")
         }
     }
     fun setOverview(enabled: Boolean) {
@@ -267,6 +273,8 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
         update(state.copy(overview = enabled))
     }
     fun acceptResponse(response: NavigationResponse) {
+        if (state.runtime.phase == EnginePhase.DISPOSED) return
+        setInputSubmitting(false)
         when (val action = NavigationResponseCoordinator.resolve(response)) {
             is ResponseAction.ApplyDraft -> {
                 if (state.runtime.phase == EnginePhase.DISPOSED) return
@@ -285,21 +293,28 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
                         update(state.copy(resolvingDestination = true, preparingRoute = true, notice = "目的地已确认，正在切换路线"))
                         port.stop()
                     } else {
-                        changeDraft(draft, schedulePlan = true)
+                        changeDraft(draft, schedulePlan = true, preserveInput = true)
                         if (state.canOpen) open()
                     }
                 }
             }
             is ResponseAction.Disambiguate -> update(state.copy(resolvingDestination = true, preparingRoute = false, candidateGroup = action.group,
                 candidateQuestion = action.question.ifBlank { action.group.hint },
-                candidateTravelMode = (response.partialTask ?: response.task)?.travelMode, notice = ""))
+                candidateTravelMode = (response.partialTask ?: response.task)?.travelMode,
+                candidateTask = response.partialTask ?: response.task, candidateGroups = response.candidateGroups, notice = ""))
             is ResponseAction.ShowMessage -> {
                 pendingRoutePlan = false
-                update(state.copy(preparingRoute = false, candidateGroup = null, candidateQuestion = "", candidateTravelMode = null, notice = action.text))
+                if (response.isError()) {
+                    // Preserve the selection context on a reported failure; never
+                    // advance to another stop without server confirmation.
+                    update(state.copy(preparingRoute = false, notice = action.text))
+                } else update(state.copy(preparingRoute = false, candidateGroup = null, candidateQuestion = "", candidateTravelMode = null,
+                    candidateTask = null, candidateGroups = emptyList(), notice = action.text))
             }
         }
     }
-    private fun changeDraft(draft: NavigationDraft, schedulePlan: Boolean = false, confirmsDestination: Boolean = true) {
+    private fun changeDraft(draft: NavigationDraft, schedulePlan: Boolean = false, confirmsDestination: Boolean = true,
+                            preserveInput: Boolean = false) {
         // Publish the new revision before native callbacks can schedule it. Invalidate
         // the old route in shared state too, so a queued UI action cannot start it.
         val unresolved = state.resolvingDestination && !confirmsDestination
@@ -309,9 +324,11 @@ class NavigationStore(private val port: NavigationPort, private val observer: (N
             update(state.copy(draft = draft, draftRevision = state.draftRevision + 1, resolvingDestination = unresolved, preparingRoute = pendingRoutePlan,
                 runtime = state.runtime.copy(route = null, routeRevision = -1),
                 shell = state.shell.copy(input = state.shell.input.copy(
-                    text = if (confirmsDestination) draft.destination?.name.orEmpty() else state.shell.input.text,
+                    // A confirmed Agent task must not replace the user's full request with just its destination.
+                    text = if (confirmsDestination && !preserveInput) draft.destination?.name.orEmpty() else state.shell.input.text,
                     submitting = false, analyzing = false)),
-                selectingWaypoint = false, candidateGroup = null, candidateQuestion = "", candidateTravelMode = null,
+                candidateGroup = null, candidateQuestion = "", candidateTravelMode = null,
+                candidateTask = null, candidateGroups = emptyList(),
                 notice = if (unresolved) "目的地尚未确认，请补充地点或选择候选"
                     else if (schedulePlan) "地点已确认，取得当前位置后自动规划路线" else "地点已更新，请重新规划路线"))
             port.clearRoute()

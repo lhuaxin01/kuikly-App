@@ -15,18 +15,13 @@ data class NavigationDraft(
         return copy(destination = place)
     }
 
-    fun withWaypoint(place: Place, limit: Int): NavigationDraft {
-        require(place.name.isNotBlank() && place.point.isValid()) { "途经点名称或坐标无效" }
-        require(waypoints.none { samePoint(it.point, place.point) }) { "该途经点已存在" }
-        require(waypoints.size < limit) { "最多添加 $limit 个途经点" }
-        return copy(waypoints = waypoints + place)
-    }
-
     fun validate(capabilities: NavigationCapabilities): String? = when {
         destination == null || !destination.point.isValid() -> "请先选择有效目的地"
         travelMode !in capabilities.travelModes -> "当前平台尚未接入此出行方式"
-        waypoints.size > capabilities.maxWaypoints -> "途经点数量超过当前平台支持范围"
-        waypoints.any { !it.point.isValid() } -> "途经点坐标无效"
+        waypoints.size > capabilities.maxWaypoints -> "最多支持 ${capabilities.maxWaypoints} 个途经点，请减少地点后重试"
+        waypoints.any { !it.point.isValid() || it.name.isBlank() } -> "途经点名称或坐标无效"
+        (waypoints + destination).zipWithNext().any { (first, second) -> samePoint(first.point, second.point) } ->
+            "相邻地点重复，请通过文字或语音说明需要调整的行程"
         else -> null
     }
 

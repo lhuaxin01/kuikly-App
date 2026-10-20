@@ -2,10 +2,12 @@ package com.example.navi_app.pages
 
 import com.example.navi_app.bridge.NavigationAgentModule
 import com.example.navi_app.bridge.NavigationModule
+import com.example.navi_app.bridge.NavigationVoiceModule
 import com.example.navi_app.navigation.agent.NavigationAgentRepository
 import com.example.navi_app.components.NavigationMap
 import com.example.navi_app.navigation.model.*
 import com.example.navi_app.navigation.presentation.*
+import com.example.navi_app.navigation.voice.*
 import com.tencent.kuikly.core.annotations.Page
 import com.tencent.kuikly.core.base.*
 import com.tencent.kuikly.core.directives.vbind
@@ -23,15 +25,21 @@ class NavigationPage : Pager() {
     private var shell by observable(NavigationShellState())
     private var authPassword by observable("")
     private var mapDiagnosticsVisible by observable(false)
+    private var voiceState by observable(VoiceInputState())
+    private var navigationInput: InputView? = null
     private lateinit var store: NavigationStore
     private lateinit var sessions: SessionCoordinator
     private lateinit var agent: NavigationAgentRepository
+    private lateinit var voice: VoiceInputCoordinator
+    private val voiceLexicon = NavigationVoiceLexicon()
     private val navigation get() = acquireModule<NavigationModule>(NavigationModule.MODULE_NAME)
     private val agentModule get() = acquireModule<NavigationAgentModule>(NavigationAgentModule.MODULE_NAME)
+    private val voiceModule get() = acquireModule<NavigationVoiceModule>(NavigationVoiceModule.MODULE_NAME)
 
     override fun createExternalModules(): Map<String, Module> = mapOf(
         NavigationModule.MODULE_NAME to NavigationModule(),
-        NavigationAgentModule.MODULE_NAME to NavigationAgentModule()
+        NavigationAgentModule.MODULE_NAME to NavigationAgentModule(),
+        NavigationVoiceModule.MODULE_NAME to NavigationVoiceModule()
     )
 
     override fun created() {
@@ -39,6 +47,7 @@ class NavigationPage : Pager() {
         store = NavigationStore(navigation) { next -> state = next; shell = next.shell }
         agent = NavigationAgentRepository(agentModule, { response ->
             store.acceptResponse(response)
+            voiceLexicon.remember(response)
             val responseText = SessionPresentation.reply(response)
             val history = if (responseText.isNotBlank()) shell.session.history + NavigationMessage(
                 id = response.requestId,
@@ -66,11 +75,23 @@ class NavigationPage : Pager() {
             applyShell(shell.copy(auth = AuthState(error = "登录已失效，请重新登录"), session = SessionState()))
         })
         store.setCandidateSelectionHandler { groupId, candidateId ->
-            store.setInputSubmitting(true, analyzing = false)
             agent.selectCandidate(groupId, candidateId, state.runtime.location,
                 state.candidateTravelMode ?: state.draft.travelMode.wireValue)
         }
         if (pageData.isOhOs) {
+            voice = VoiceInputCoordinator(
+                port = voiceModule,
+                readInput = { shell.input.text },
+                onRecognized = { text -> submitInput(text) },
+                readHotwords = { voiceLexicon.words(state) },
+                publish = { next ->
+                    val finished = voiceState.active && !next.active
+                    voiceState = next
+                    applyShell(shell.copy(input = shell.input.copy(text = next.text, voiceActive = next.active,
+                        micListening = next.recording, error = next.error)))
+                    if (finished) navigationInput?.setText(next.text)
+                }
+            )
             navigation.subscribe(store::runtime, store::selectPoint, store::configure, store::commandFailed)
             store.activateMap()
             agentModule.restoreAuth { result ->
@@ -90,6 +111,9 @@ class NavigationPage : Pager() {
     }
 
     override fun pageWillDestroy() {
+        if (::voice.isInitialized) voice.destroy()
+        voiceLexicon.clear()
+        navigationInput = null
         sessions.invalidate()
         if (pageData.isOhOs) navigation.unsubscribe()
         agent.closeSession()
@@ -126,49 +150,65 @@ class NavigationPage : Pager() {
                     // uses its space, preserving the draft across async phases.
                     visibility(!ctx.state.busy)
                 }
-                ctx.compactAction(this, if (ctx.shell.input.micListening) "停止" else "语音", { !ctx.state.busy }) {
-                    ctx.applyShell(ctx.shell.copy(input = ctx.shell.input.copy(micListening = !ctx.shell.input.micListening)))
-                    ctx.store.message(if (ctx.shell.input.micListening) "正在等待鸿蒙语音输入适配" else "已停止语音输入")
-                }
-                Input {
+                ctx.voiceButton(this)
+                View {
                     attr {
-                        flex(1f); height(48f); marginLeft(8f); text(ctx.shell.input.text)
-                        placeholder("输入目的地或导航问题"); placeholderColor(Color(0xCCFFFFFF))
-                        backgroundColor(NavigationDesignTokens.searchInput); color(Color.WHITE); fontSize(15f)
-                        returnKeyTypeSend(); maxTextLength(200); editable(!ctx.state.busy)
+                        flex(1f); height(48f); marginLeft(8f); positionRelative()
+                        backgroundColor(NavigationDesignTokens.searchInput); borderRadius(8f)
                     }
-                    event {
-                        textDidChange(true) { params -> ctx.updateInput(params.text) }
-                        inputReturn { params -> ctx.submitInput(params.text) }
+                    Input {
+                        ctx.navigationInput = this
+                        attr {
+                            positionAbsolute(); absolutePositionAllZero(); text(ctx.shell.input.text)
+                            placeholder("输入目的地或导航问题"); placeholderColor(Color(0xCCFFFFFF))
+                            backgroundColor(NavigationDesignTokens.searchInput); color(Color.WHITE); fontSize(15f); returnKeyTypeSend()
+                            editable(ctx.state.canSendInput)
+                        }
+                        event {
+                            textDidChange(true) { params -> ctx.updateInput(params.text) }
+                            inputReturn { params -> ctx.submitInput(params.text) }
+                        }
                     }
                 }
-                ctx.compactAction(this, "发送", { ctx.shell.input.text.isNotBlank() && ctx.state.canSubmit }) {
+                ctx.compactAction(this, "发送", { ctx.shell.input.text.isNotBlank() && ctx.state.canSendInput }) {
                     ctx.submitInput()
                 }
             }
             with(parent) {
-                vif({ ctx.state.candidateGroup != null }) {
-                    val group = ctx.state.candidateGroup
+                vif({ ctx.state.candidateGroup != null }) { vbind({ ctx.state.candidateGroup }) {
+                    val group = ctx.state.candidateGroup ?: return@vbind
                     View {
                         attr {
                             positionAbsolute(); absolutePosition(top = 116f, left = 12f, right = 12f); zIndex(18, false)
                             padding(10f); backgroundColor(NavigationDesignTokens.surface); borderRadius(NavigationDesignTokens.cardRadius)
                         }
-                        Text { attr { text(ctx.state.candidateQuestion.ifBlank { group?.hint ?: "请选择地点" }); fontSize(NavigationDesignTokens.bodySize); color(NavigationDesignTokens.title); lines(2) } }
-                        group?.candidates?.forEach { candidate ->
+                        Text { attr { text(ctx.state.candidateQuestion.ifBlank { group.hint.ifBlank { "请选择地点" } }); fontSize(NavigationDesignTokens.bodySize); color(NavigationDesignTokens.title); lines(2) } }
+                        Text { attr { text("待确认 ${ctx.state.candidateGroups.count { it.candidates.isNotEmpty() }} 个地点，按行程顺序选择"); fontSize(12f); color(NavigationDesignTokens.secondaryText); marginTop(4f); lines(1) } }
+                        vif({ ctx.state.candidateTask?.stops?.any { !it.needsConfirmation && it.point?.isValid() == true && it.role != "origin" } == true }) {
+                            Text { attr {
+                                text("已确认：" + ctx.state.candidateTask?.stops.orEmpty()
+                                    .filter { !it.needsConfirmation && it.point?.isValid() == true && it.role != "origin" }
+                                    .joinToString(" → ") { it.name })
+                                fontSize(12f); color(NavigationDesignTokens.secondaryText); marginTop(4f); lines(2)
+                            } }
+                        }
+                        Scroller {
+                            attr { height(minOf(group.candidates.size * 76f, minOf(260f, maxOf(100f, ctx.pageData.pageViewHeight - 420f)))); marginTop(4f) }
+                        group.candidates.forEach { candidate ->
                             View {
-                                attr { marginTop(6f); padding(NavigationDesignTokens.compactPadding); borderRadius(NavigationDesignTokens.compactRadius); backgroundColor(NavigationDesignTokens.diagnosticSurface) }
+                                attr { marginTop(6f); padding(NavigationDesignTokens.compactPadding); borderRadius(NavigationDesignTokens.compactRadius); backgroundColor(NavigationDesignTokens.diagnosticSurface); opacity(if (ctx.state.busy || ctx.voiceState.active) 0.5f else 1f) }
                                 Text { attr { text(candidate.name.ifBlank { "未命名地点" }); fontSize(NavigationDesignTokens.bodySize); fontWeightMedium(); color(NavigationDesignTokens.title); lines(1) } }
                                 Text { attr { text(candidate.address); fontSize(NavigationDesignTokens.secondarySize); color(NavigationDesignTokens.secondaryText); marginTop(2f); lines(2) } }
-                                event { click { ctx.store.chooseCandidate(candidate) } }
+                                event { click { ctx.store.chooseCandidate(candidate, group.id) } }
                             }
                         }
+                        }
                     }
-                }
+                } }
             }
             vif({ !ctx.shell.sessionOverlayVisible }) {
                 View {
-                    attr { positionAbsolute(); absolutePosition(top = 18f, right = 16f); width(72f); height(44f); zIndex(25, false); allCenter(); backgroundColor(NavigationDesignTokens.navigationBar); borderRadius(22f); opacity(if (ctx.state.busy) 0.5f else 1f); touchEnable(!ctx.state.busy) }
+                    attr { positionAbsolute(); absolutePosition(top = 18f, right = 16f); width(72f); height(44f); zIndex(25, false); allCenter(); backgroundColor(NavigationDesignTokens.navigationBar); borderRadius(22f); opacity(if (ctx.state.busy || ctx.voiceState.active) 0.5f else 1f); touchEnable(!ctx.state.busy && !ctx.voiceState.active) }
                     Text { attr { text("会话"); fontSize(14f); fontWeightBold(); color(Color.WHITE) } }
                     event { click { ctx.openSessionOverlay() } }
                 }
@@ -206,6 +246,10 @@ class NavigationPage : Pager() {
                         vif({ ctx.state.draftRevision > 0 && ctx.state.draft.destination != null }) {
                             Text { attr { text("目的地：${ctx.state.draft.destination?.name.orEmpty()}"); fontSize(14f); color(NavigationDesignTokens.title); marginTop(4f); lines(2) } }
                         }
+                        vif({ ctx.state.mode != MapMode.GUIDANCE && ctx.state.draft.waypoints.isNotEmpty() }) { ctx.agentWaypoints(this) }
+                        vif({ ctx.state.mode == MapMode.GUIDANCE && ctx.state.draft.waypoints.isNotEmpty() }) {
+                            Text { attr { text("途经顺序：" + ctx.state.draft.waypoints.joinToString(" → ") { it.name }); fontSize(12f); color(NavigationDesignTokens.secondaryText); marginTop(4f); lines(2) } }
+                        }
                         vif({ !ctx.state.busy && (ctx.state.notice.isNotBlank() || ctx.state.runtime.warning.isNotBlank()) }) {
                             Text { attr { text(ctx.state.notice.ifBlank { ctx.state.runtime.warning }); fontSize(NavigationDesignTokens.secondarySize); color(NavigationDesignTokens.warning); marginTop(4f); lines(0) } }
                         }
@@ -220,12 +264,12 @@ class NavigationPage : Pager() {
                             } ?: ""); fontSize(14f); color(NavigationDesignTokens.title); marginTop(5f); lines(2) } }
                         }
                         vif({ ctx.state.runtime.phase == EnginePhase.ERROR }) {
-                            View { attr { flexDirectionRow(); marginTop(6f) }; ctx.action(this, "重试地图", { ctx.state.environment != null && !ctx.state.busy }) { ctx.store.open() } }
+                            View { attr { flexDirectionRow(); marginTop(6f) }; ctx.action(this, "重试地图", { ctx.state.environment != null && !ctx.state.busy && !ctx.voiceState.active }) { ctx.store.open() } }
                         }
                         vif({ ctx.state.mode == MapMode.GUIDANCE }) {
                             View { attr { flexDirectionRow(); marginTop(6f) }
                                 ctx.action(this, if (ctx.state.overview) "跟随当前位置" else "路线全览", { !ctx.state.busy }) { ctx.store.setOverview(!ctx.state.overview) }
-                                ctx.action(this, "退出导航", { ctx.state.canExitGuidance }) { ctx.store.exitGuidance() }
+                                ctx.action(this, "退出导航", { ctx.state.canExitGuidance }) { ctx.cancelVoice(); ctx.store.exitGuidance() }
                             }
                         }
                         vif({ ctx.state.mode != MapMode.GUIDANCE && ctx.state.runtime.phase != EnginePhase.IDLE && ctx.state.runtime.phase != EnginePhase.ERROR }) {
@@ -243,6 +287,60 @@ class NavigationPage : Pager() {
         }
     }
 
+    private fun voiceButton(parent: ViewContainer<*, *>) {
+        val ctx = this
+        parent.View {
+            attr {
+                width(52f); height(52f); allCenter(); borderRadius(26f)
+                backgroundColor(if (ctx.voiceState.recording) Color(0xFFB83A3A) else NavigationDesignTokens.primary)
+                opacity(if (ctx.state.busy || ctx.voiceState.phase == VoiceInputPhase.STARTING) 0.5f else 1f)
+                touchEnable(!ctx.state.busy && ctx.voiceState.phase != VoiceInputPhase.STARTING)
+            }
+            Text { attr { text(when {
+                ctx.voiceState.phase == VoiceInputPhase.STARTING -> "准备中"
+                ctx.voiceState.transcribing -> "取消"
+                ctx.voiceState.recording -> "结束"
+                else -> "语音"
+            }); fontSize(12f); color(Color.WHITE) } }
+            event { click {
+                if (!ctx.state.busy && ctx.voiceState.phase != VoiceInputPhase.STARTING) {
+                    if (!ctx.pageData.isOhOs) ctx.store.setInputError("当前平台暂未接入语音识别")
+                    else if (ctx.voiceState.transcribing) ctx.voice.cancel()
+                    else {
+                        if (!ctx.voiceState.active) ctx.navigationInput?.blur()
+                        ctx.voice.toggle()
+                    }
+                }
+            } }
+        }
+        // Show the recording state even when partial text has filled the field.
+        with(parent) { vif({ ctx.voiceState.active }) {
+            View {
+                attr { positionAbsolute(); absolutePosition(bottom = 66f, left = 0f, right = 0f); padding(8f); borderRadius(8f); backgroundColor(NavigationDesignTokens.searchPanel) }
+                Text { attr { text(ctx.voiceState.statusText); fontSize(12f); color(Color.WHITE); lines(1) } }
+                vif({ ctx.voiceState.text.isNotBlank() }) {
+                    Text { attr { text(ctx.voiceState.text.takeLast(64)); fontSize(12f); color(Color(0xCCFFFFFF)); lines(2); marginTop(4f) } }
+                }
+            }
+        } }
+    }
+
+    /** The Agent owns the stop list; changes go through the same text/voice request. */
+    private fun agentWaypoints(parent: ViewContainer<*, *>) {
+        val ctx = this
+        with(parent) {
+            Text { attr { text("途经顺序 · ${ctx.state.draft.waypoints.size} 站"); fontSize(12f); color(NavigationDesignTokens.secondaryText); marginTop(6f) } }
+            Scroller {
+                attr { height(minOf(96f, ctx.state.draft.waypoints.size * 32f)); marginTop(4f) }
+                vbind({ ctx.state.draft.waypoints }) {
+                    ctx.state.draft.waypoints.forEachIndexed { index, place ->
+                        Text { attr { height(32f); text("${index + 1}. ${place.name}"); fontSize(13f); color(NavigationDesignTokens.title); lines(1) } }
+                    }
+                }
+            }
+        }
+    }
+
     /** Loading stays in the input area. Store guards protect the task while the
      * user can still pan/zoom the map; cancellation remains reachable. */
     private fun inputProgress(parent: ViewContainer<*, *>) {
@@ -254,7 +352,13 @@ class NavigationPage : Pager() {
                 backgroundColor(NavigationDesignTokens.searchPanel); borderRadius(18f)
             }
             ActivityIndicator { attr { size(18f, 18f); isGrayStyle(false) } }
-            Text { attr { flex(1f); marginLeft(10f); text(ctx.state.busyMessage); fontSize(14f); color(Color.WHITE); lines(1) } }
+            View {
+                attr { flex(1f); marginLeft(10f); justifyContentCenter() }
+                vif({ ctx.shell.input.text.isNotBlank() }) {
+                    Text { attr { text(ctx.shell.input.text); fontSize(14f); color(Color.WHITE); lines(1) } }
+                }
+                Text { attr { text(ctx.state.busyMessage); fontSize(12f); color(Color(0xCCFFFFFF)); lines(1) } }
+            }
             View {
                 attr { width(56f); height(48f); marginLeft(4f); allCenter(); borderRadius(8f); backgroundColor(NavigationDesignTokens.searchInput) }
                 Text { attr { text("取消"); fontSize(14f); color(Color.WHITE) } }
@@ -285,17 +389,20 @@ class NavigationPage : Pager() {
                 }
                 ctx.overlayAction(this,
                     if (ctx.shell.sessionOverlayMode == SessionOverlayMode.LIST) "内容" else "切换",
-                    { !ctx.state.busy && !ctx.shell.session.loading && !ctx.shell.session.historyLoading }) {
+                    { !ctx.state.busy && !ctx.voiceState.active && !ctx.shell.session.loading && !ctx.shell.session.historyLoading }) {
                     ctx.applyShell(ctx.shell.copy(sessionOverlayMode =
                         if (ctx.shell.sessionOverlayMode == SessionOverlayMode.LIST) SessionOverlayMode.HISTORY else SessionOverlayMode.LIST))
                     if (ctx.shell.sessionOverlayMode == SessionOverlayMode.LIST) ctx.loadSessions()
                 }
-                ctx.overlayAction(this, "刷新", { !ctx.state.busy && !ctx.shell.session.loading && !ctx.shell.session.historyLoading }) { ctx.refreshSessionOverlay() }
+                ctx.overlayAction(this, "刷新", { !ctx.state.busy && !ctx.voiceState.active && !ctx.shell.session.loading && !ctx.shell.session.historyLoading }) { ctx.refreshSessionOverlay() }
                 ctx.overlayAction(this, "×", { true }) { ctx.applyShell(ctx.shell.copy(sessionOverlayVisible = false)) }
             }
             vif({ !ctx.shell.auth.loggedIn }) {
                 Text { attr { marginTop(24f); text("登录后可查看和恢复 navi-claw 会话"); fontSize(NavigationDesignTokens.bodySize); color(NavigationDesignTokens.secondaryText); lines(2) } }
-                ctx.action(this, "去登录", { true }) { ctx.applyShell(ctx.shell.copy(tab = NavigationTab.MINE, sessionOverlayVisible = false)) }
+                ctx.action(this, "去登录", { !ctx.state.busy }) {
+                    ctx.selectTab(NavigationTab.MINE)
+                    ctx.applyShell(ctx.shell.copy(sessionOverlayVisible = false))
+                }
             }
             vif({ ctx.shell.auth.loggedIn }) {
                 Text {
@@ -323,7 +430,7 @@ class NavigationPage : Pager() {
                                     attr { marginBottom(8f); padding(12f); backgroundColor(if (item.id == ctx.shell.session.activeSessionId) NavigationDesignTokens.diagnosticSurface else NavigationDesignTokens.pageBackground); borderRadius(12f) }
                                     Text { attr { text(item.title.ifBlank { "未命名会话" }); fontSize(17f); fontWeightBold(); color(NavigationDesignTokens.title); lines(1) } }
                                     Text { attr { text("点击查看对话内容，并在首页继续此会话"); fontSize(12f); color(NavigationDesignTokens.secondaryText); marginTop(6f); lines(2) } }
-                                    event { click { if (!ctx.state.busy) { ctx.selectSession(item); ctx.applyShell(ctx.shell.copy(sessionOverlayMode = SessionOverlayMode.HISTORY)) } } }
+                                    event { click { if (!ctx.state.busy && !ctx.voiceState.active) { ctx.selectSession(item); ctx.applyShell(ctx.shell.copy(sessionOverlayMode = SessionOverlayMode.HISTORY)) } } }
                                 }
                             }
                         }
@@ -463,10 +570,10 @@ class NavigationPage : Pager() {
         parent.View {
             attr { flex(1f); height(52f); opacity(if (ctx.state.busy) 0.5f else 1f); touchEnable(!ctx.state.busy) }
             vif({ ctx.shell.tab == tab }) {
-                View { attr { flex(1f); allCenter(); borderRadius(26f); backgroundColor(NavigationDesignTokens.navigationBarSelected) }; Text { attr { text(label); fontSize(15f); fontWeightBold(); color(NavigationDesignTokens.title) } }; event { click { if (!ctx.state.busy) ctx.applyShell(ctx.shell.copy(tab = tab)) } } }
+                View { attr { flex(1f); allCenter(); borderRadius(26f); backgroundColor(NavigationDesignTokens.navigationBarSelected) }; Text { attr { text(label); fontSize(15f); fontWeightBold(); color(NavigationDesignTokens.title) } }; event { click { ctx.selectTab(tab) } } }
             }
             vif({ ctx.shell.tab != tab }) {
-                View { attr { flex(1f); allCenter(); borderRadius(26f); backgroundColor(NavigationDesignTokens.navigationBar) }; Text { attr { text(label); fontSize(15f); fontWeightBold(); color(Color(0xD9FFFFFF)) } }; event { click { if (!ctx.state.busy) ctx.applyShell(ctx.shell.copy(tab = tab)) } } }
+                View { attr { flex(1f); allCenter(); borderRadius(26f); backgroundColor(NavigationDesignTokens.navigationBar) }; Text { attr { text(label); fontSize(15f); fontWeightBold(); color(Color(0xD9FFFFFF)) } }; event { click { ctx.selectTab(tab) } } }
             }
         }
     }
@@ -504,16 +611,32 @@ class NavigationPage : Pager() {
         if (::store.isInitialized && store.state.shell != next) store.updateShell { next }
     }
 
-    private fun updateInput(value: String) { applyShell(shell.copy(input = shell.input.copy(text = value, error = ""))) }
+    private fun updateInput(value: String) {
+        if (!state.canSendInput) return
+        if (voiceState.active) voice.editText(value)
+        else applyShell(shell.copy(input = shell.input.copy(text = value, error = "")))
+    }
+
+    private fun cancelVoice() { if (::voice.isInitialized && voiceState.active) voice.cancel() }
+
+    private fun selectTab(tab: NavigationTab) {
+        if (state.busy) return
+        if (shell.tab != tab) cancelVoice()
+        applyShell(shell.copy(tab = tab))
+    }
 
     private fun stopNavigation() {
+        cancelVoice()
         agent.cancelPending()
         store.setInputSubmitting(false)
         store.stop()
     }
 
     private fun submitInput(value: String = shell.input.text) {
-        val text = value.trim()
+        if (!state.canSendInput) return
+        // Unedited dictation waits for the final correction; an explicitly edited
+        // draft can be sent immediately. The coordinator retires each attempt once.
+        val text = if (voiceState.active) voice.takeForSubmit(value) ?: return else value.trim()
         if (text.isBlank() || !state.canSubmit) return
         if (!shell.auth.loggedIn) {
             store.setInputError("请先登录后使用导航智能体")
@@ -536,7 +659,7 @@ class NavigationPage : Pager() {
     }
 
     private fun authenticate() {
-        if (state.busy) return
+        if (state.busy || voiceState.active) return
         val username = shell.auth.username.trim()
         val password = authPassword
         val displayName = shell.auth.displayName.trim()
@@ -567,7 +690,7 @@ class NavigationPage : Pager() {
     private fun loadSessions() = sessions.refreshList()
 
     private fun selectSession(item: NavigationSessionItem) {
-        if (state.busy) {
+        if (state.busy || voiceState.active) {
             applyShell(shell.copy(session = shell.session.copy(error = "请等待当前导航请求完成后再切换会话")))
             return
         }
@@ -575,7 +698,7 @@ class NavigationPage : Pager() {
     }
 
     private fun openSessionOverlay() {
-        if (state.busy) return
+        if (state.busy || voiceState.active) return
         applyShell(shell.copy(sessionOverlayVisible = true))
         if (!shell.auth.loggedIn || shell.input.submitting) return
         if (shell.session.activeSessionId.isBlank()) {
@@ -585,13 +708,14 @@ class NavigationPage : Pager() {
     }
 
     private fun refreshSessionOverlay() {
-        if (!shell.auth.loggedIn || state.busy) return
+        if (!shell.auth.loggedIn || state.busy || voiceState.active) return
         if (shell.sessionOverlayMode == SessionOverlayMode.LIST || shell.session.activeSessionId.isBlank()) loadSessions()
         else sessions.refreshHistory()
     }
 
     private fun logout() {
-        if (state.busy) return
+        if (state.busy || voiceState.active) return
+        voiceLexicon.clear()
         sessions.invalidate()
         agent.resetSession()
         applyShell(NavigationShellState(tab = NavigationTab.MINE))
@@ -603,7 +727,7 @@ class NavigationPage : Pager() {
         }
     }
     private fun createSession() {
-        if (state.busy) {
+        if (state.busy || voiceState.active) {
             applyShell(shell.copy(session = shell.session.copy(error = "请等待当前导航请求完成后再创建会话")))
             return
         }

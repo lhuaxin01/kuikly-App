@@ -2,8 +2,18 @@ package com.example.navi_app.navigation
 
 import com.example.navi_app.navigation.agent.*
 import com.example.navi_app.navigation.domain.NavigationTextIntent
+import com.example.navi_app.navigation.domain.NavigationDraft
+import com.example.navi_app.navigation.model.EnginePhase
 import com.example.navi_app.navigation.model.GeoPoint
+import com.example.navi_app.navigation.model.NavigationCapabilities
+import com.example.navi_app.navigation.model.Place
+import com.example.navi_app.navigation.model.RuntimeSnapshot
 import com.example.navi_app.navigation.model.TravelMode
+import com.example.navi_app.navigation.port.NavigationEnvironment
+import com.example.navi_app.navigation.port.NavigationPort
+import com.example.navi_app.navigation.presentation.NavigationStore
+import com.example.navi_app.navigation.protocol.Candidate
+import com.example.navi_app.navigation.protocol.CandidateGroup
 import com.example.navi_app.navigation.protocol.NavigationResponse
 import com.example.navi_app.navigation.protocol.NavigationStop
 import com.example.navi_app.navigation.protocol.NavigationTask
@@ -121,6 +131,125 @@ class NavigationAgentTest {
         assertEquals("group-school", request.groupId)
         assertEquals("school-2", request.candidateId)
         assertEquals("s1", request.sessionId)
+    }
+
+    @Test fun multipleWaypointsAndDestinationConfirmInOrderWithoutLateResponsesReplacingTheNextGroup() {
+        val transport = FakeTransport()
+        val navigation = RecordingNavigationPort()
+        val origin = GeoPoint(39.9, 116.4)
+        val selected = listOf(
+            Candidate("shared-item-id", "医院东门", "医院路", GeoPoint(39.91, 116.41)),
+            Candidate("shared-item-id", "公园南门", "公园路", GeoPoint(39.92, 116.42)),
+            Candidate("school-east", "学校东门", "学校路", GeoPoint(39.93, 116.43))
+        )
+        val groups = selected.mapIndexed { index, candidate ->
+            CandidateGroup("stop-group-$index", index + 1, listOf(candidate))
+        }
+        var pendingTask = NavigationTask(listOf(NavigationStop("origin", "当前位置", origin)) +
+            selected.mapIndexed { index, candidate ->
+                NavigationStop(if (index == selected.lastIndex) "destination" else "waypoint",
+                    candidate.name, null, needsConfirmation = true)
+            }, "walk")
+        val store = NavigationStore(navigation) {}
+        store.configure(NavigationEnvironment(Place("初始地图中心", origin), true, "test-app",
+            NavigationCapabilities(travelModes = setOf(TravelMode.DRIVE, TravelMode.WALK, TravelMode.RIDE))))
+        store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = origin))
+        val responses = mutableListOf<NavigationResponse>()
+        val repository = NavigationAgentRepository(transport, { response ->
+            responses += response
+            store.acceptResponse(response)
+        }, store::setInputError)
+        store.setCandidateSelectionHandler { groupId, candidateId ->
+            repository.selectCandidate(groupId, candidateId, store.state.runtime.location,
+                store.state.candidateTravelMode)
+        }
+        val sentence = "步行先去医院，再去公园，最后到学校"
+        store.setInputText(sentence)
+        store.beginDestinationRequest()
+        store.setInputSubmitting(true)
+        repository.submitText(sentence, "walk", origin)
+        val initialResponse = NavigationResponse("ok", "disambiguation", false, false, null,
+            candidateGroups = groups.reversed(), partialTask = pendingTask,
+            sessionId = "multi-stop-session", requestId = transport.sent.single().requestId!!)
+        transport.respond(initialResponse)
+        assertEquals(groups.first(), store.state.candidateGroup)
+        assertEquals("multi-stop-session", repository.snapshot().sessionId)
+        assertTrue(navigation.planned.isEmpty(), "an incomplete itinerary must not be planned")
+
+        val acceptedResponses = mutableListOf(initialResponse)
+        for (index in selected.indices) {
+            val group = groups[index]
+            val candidate = selected[index]
+            assertEquals(group, store.state.candidateGroup)
+            assertFalse(store.state.busy)
+            if (index > 0) {
+                val count = transport.sent.size
+                store.chooseCandidate(candidate, groups[index - 1].id)
+                assertEquals(count, transport.sent.size, "a queued card from the previous group cannot submit this group")
+            }
+            store.chooseCandidate(candidate, group.id)
+            assertTrue(store.state.busy)
+            assertEquals(group, store.state.candidateGroup, "keep the current card until the server confirms it")
+            val request = transport.sent.last()
+            assertEquals(index + 2, transport.sent.size)
+            assertEquals("multi-stop-session", request.sessionId)
+            assertEquals("disambiguation_choice", request.kind)
+            assertEquals(NavigationAgentRequestType.CANDIDATE_SELECTION, request.type)
+            assertEquals(group.id, request.groupId)
+            assertEquals(candidate.id, request.candidateId)
+            assertEquals("walk", request.travelMode)
+            // The shared bridge carries one pair; the native adapter maps candidate_id
+            // to the sole disambiguation_choices[].chosen_item_id wire entry.
+            val encoded = NavigationAgentRequestCodec.encode(request)
+            assertEquals(group.id, encoded.optString("group_id"))
+            assertEquals(candidate.id, encoded.optString("candidate_id"))
+            assertFalse(encoded.has("existing_task"))
+            store.chooseCandidate(candidate, group.id)
+            assertEquals(index + 2, transport.sent.size, "a second tap cannot send a duplicate choice")
+
+            val stateBeforeLateResponse = store.state
+            val responseCount = responses.size
+            // The preceding request may deliver its event/response twice after
+            // the next choice has already started. Neither callback may unlock it.
+            transport.respond(acceptedResponses[index], index)
+            transport.respond(acceptedResponses[index], transport.sent.lastIndex)
+            assertEquals(stateBeforeLateResponse, store.state)
+            assertEquals(responseCount, responses.size)
+            assertEquals(request.requestId, repository.snapshot().pendingRequestId)
+
+            pendingTask = pendingTask.copy(stops = pendingTask.stops.mapIndexed { stopIndex, stop ->
+                if (stopIndex == group.stopIndex) stop.copy(name = candidate.name,
+                    point = candidate.point, needsConfirmation = false) else stop
+            })
+            val remaining = groups.drop(index + 1)
+            val result = NavigationResponse("ok", if (remaining.isEmpty()) "navigation_task" else "disambiguation",
+                remaining.isEmpty(), false, if (remaining.isEmpty()) pendingTask else null,
+                candidateGroups = remaining.reversed(), partialTask = if (remaining.isEmpty()) null else pendingTask,
+                sessionId = "multi-stop-session", requestId = request.requestId!!)
+            acceptedResponses += result
+            transport.respond(result)
+            assertNull(repository.snapshot().pendingRequestId)
+            assertEquals(selected.take(index + 1).map { it.point },
+                pendingTask.stops.drop(1).take(index + 1).map { it.point })
+            if (remaining.isNotEmpty()) {
+                assertEquals(pendingTask, store.state.candidateTask)
+                assertTrue(navigation.planned.isEmpty())
+            }
+        }
+        assertEquals(4, transport.sent.map { it.requestId }.distinct().size)
+        assertEquals(4, responses.size)
+        assertNull(store.state.candidateGroup)
+        assertTrue(store.state.candidateGroups.isEmpty())
+        assertEquals(sentence, store.state.shell.input.text)
+        val planned = navigation.planned.single()
+        assertEquals(TravelMode.WALK, planned.travelMode)
+        assertEquals(selected.dropLast(1).map { Place(it.name, it.point!!) }, planned.waypoints)
+        assertEquals(Place(selected.last().name, selected.last().point!!), planned.destination)
+        assertEquals(pendingTask, responses.last().task)
+        val finalState = store.state
+        acceptedResponses.dropLast(1).forEachIndexed { index, late -> transport.respond(late, index) }
+        assertEquals(finalState, store.state)
+        assertEquals(1, navigation.planned.size)
     }
 
     @Test fun repositoryCreatesSessionAndSeparatesFeedbackFromNavigation() {
@@ -258,6 +387,19 @@ class NavigationAgentTest {
         repository.submitText("第二次")
         assertEquals("after-login", repository.snapshot().sessionId)
         assertEquals(2, transport.sent.count { it.type == NavigationAgentRequestType.TEXT })
+    }
+
+    private class RecordingNavigationPort : NavigationPort {
+        val planned = mutableListOf<NavigationDraft>()
+        override fun open() {}
+        override fun locate() {}
+        override fun plan(draft: NavigationDraft, revision: Int) { planned += draft }
+        override fun start(simulation: Boolean, revision: Int) {}
+        override fun stop() {}
+        override fun exitGuidance() {}
+        override fun clearRoute() {}
+        override fun overview() {}
+        override fun follow() {}
     }
 
     private class FakeTransport : NavigationAgentTransport {

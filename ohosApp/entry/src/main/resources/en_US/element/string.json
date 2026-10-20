@@ -1,6 +1,10 @@
 {
   "string": [
     {
+      "name": "navigation_microphone_reason",
+      "value": "Recognize destinations and stops while you use voice input."
+    },
+    {
       "name": "module_desc",
       "value": "Map and navigation"
     },

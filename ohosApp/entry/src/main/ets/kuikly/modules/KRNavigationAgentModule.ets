@@ -5,11 +5,12 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
 import { KRAny, KuiklyRenderBaseModule, KuiklyRenderCallback } from '@kuikly-open/render';
+import { MAX_NAVIGATION_WAYPOINTS } from '../../navigation/domain/NavigationCapabilities';
 
 interface AgentRequest { type?: string; kind?: string; existing_task?: Object; request_id?: string; feedback_request_id?: string; trace_id?: string; session_id?: string; text?: string; group_id?: string; candidate_id?: string; rating?: number; accepted?: boolean; comment?: string; travel_mode?: string; location?: Object; }
 /** The WebSocket endpoint is the sole navi-claw transport configuration. */
 interface GatewayConfig { naviClawWebSocketUrl?: string; naviClawLoginPath?: string; naviClawRegisterPath?: string; naviClawChannelId?: string; }
-interface PendingCall { callback: KuiklyRenderCallback; requestId: string; timer?: number; persistSessionId?: string; }
+interface PendingCall { callback: KuiklyRenderCallback; requestId: string; timer?: number; persistSessionId?: string; responseTimeoutMs?: number; navigationRequest?: boolean; }
 interface ChannelPeer { deviceId: string; }
 interface ChannelCapabilities { supports_waypoints: boolean; max_waypoints: number; locale: string; }
 interface ChannelMetadata { platform: string; client: string; }
@@ -53,6 +54,7 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
   private controlCallbacks: Map<string, (ok: boolean, payload: Object) => void> = new Map();
   private socketGeneration: number = 0;
   private handshakeTimer?: number;
+  private writeTimers: Map<string, number> = new Map();
   private pending: Map<string, PendingCall> = new Map();
 
   constructor(context?: common.UIAbilityContext) { super(); this.context = context; this.config = this.loadConfig(); }
@@ -102,14 +104,18 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     catch (_) { this.fail(callback, 'INVALID_REQUEST', '导航请求格式无效'); return; }
     const requestId: string = request.request_id ?? `navi-${++this.sequence}`;
     if (!this.gatewayWebSocketUrl()) { this.fail(callback, 'AGENT_ENDPOINT_NOT_CONFIGURED', `navi-claw WebSocket 地址尚未配置（请求 ${requestId}）`); return; }
-    if (callback !== null) {
-      const pending: PendingCall = { callback, requestId };
-      pending.timer = setTimeout(() => this.failPending(requestId, 'AGENT_TIMEOUT', '导航服务响应超时'), 30000);
-      this.pending.set(requestId, pending);
-    }
+    if (callback === null) return;
+    if (this.pending.has(requestId)) { this.fail(callback, 'AGENT_DUPLICATE_REQUEST', '该导航请求正在处理中，请勿重复提交'); return; }
+    // Match MapTemplate: navigation may require several model/tool rounds and
+    // has no fixed processing deadline. Handshake and socket writes are bounded
+    // separately; the user can explicitly cancel an in-flight navigation.
+    const pending: PendingCall = { callback, requestId, responseTimeoutMs: request.type === 'feedback' ? 30000 : undefined,
+      navigationRequest: request.type !== 'feedback' };
+    this.pending.set(requestId, pending);
     this.ensureSocket().then(async (ready: boolean) => {
-      if (!ready || !this.pending.has(requestId)) { if (!ready) this.failPending(requestId, 'AGENT_CONNECT_FAILED', '无法连接 navi-claw 导航服务'); return; }
-      this.sendOrQueue(this.navigationFrame(request, requestId));
+      if (this.pending.get(requestId) !== pending) return;
+      if (!ready) { this.failPending(requestId, 'AGENT_CONNECT_FAILED', '无法连接 navi-claw 导航服务'); return; }
+      this.sendOrQueue(this.navigationFrame(request, requestId), requestId);
     }).catch((error: Object) => this.failPending(requestId, this.errorCode(error), '连接 navi-claw 导航服务失败'));
   }
 
@@ -163,8 +169,7 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     }
     const requestId: string = `sys-${++this.sequence}`;
     if (callback !== null) {
-      const pending: PendingCall = { callback, requestId, persistSessionId: sessionId };
-      pending.timer = setTimeout(() => this.failPending(requestId, 'AGENT_TIMEOUT', '会话请求超时'), 30000);
+      const pending: PendingCall = { callback, requestId, persistSessionId: sessionId, responseTimeoutMs: 30000 };
       this.pending.set(requestId, pending);
     }
     this.ensureSocket().then(async (ready: boolean) => {
@@ -172,7 +177,7 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
       const generation: number = this.socketGeneration;
       const deviceId: string = await this.readDeviceId();
       if (generation !== this.socketGeneration || !this.pending.has(requestId)) return;
-      const attach: ChannelAttachParams = { channelId: this.config.naviClawChannelId ?? 'navigation-app', peer: { deviceId }, conversationId: this.conversationId, sessionId, capabilities: { supports_waypoints: true, max_waypoints: 3, locale: 'zh-CN' }, metadata: { platform: 'harmony', client: 'myapplication' }, attachMode: 'resume_only' };
+      const attach: ChannelAttachParams = { channelId: this.config.naviClawChannelId ?? 'navigation-app', peer: { deviceId }, conversationId: this.conversationId, sessionId, capabilities: { supports_waypoints: true, max_waypoints: MAX_NAVIGATION_WAYPOINTS, locale: 'zh-CN' }, metadata: { platform: 'harmony', client: 'myapplication' }, attachMode: 'resume_only' };
       this.sendOrQueue(JSON.stringify({ type: 'req', id: requestId, method: 'channel.attach', params: attach }), requestId);
     }).catch((error: Object) => this.failPending(requestId, this.errorCode(error), '会话请求失败'));
   }
@@ -208,18 +213,32 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     }).catch((error: Object) => { request.destroy(); this.fail(callback, this.errorCode(error), '登录请求失败'); });
   }
 
-  private async ensureSocket(): Promise<boolean> {
-    if (this.socketOpen && this.socketReady && this.socket) return true;
-    if (this.socketOpening) return new Promise<boolean>((resolve) => this.readyWaiters.push(resolve));
-    const url: string = this.gatewayWebSocketUrl(); if (!url) return false;
+  private ensureSocket(): Promise<boolean> {
+    if (this.destroyed) return Promise.resolve(false);
+    if (this.socketOpen && this.socketReady && this.socket) return Promise.resolve(true);
+    const url: string = this.gatewayWebSocketUrl(); if (!url) return Promise.resolve(false);
+    const ready = new Promise<boolean>((resolve) => this.readyWaiters.push(resolve));
+    if (this.socketOpening) return ready;
     this.socketOpening = true;
+    const generation: number = ++this.socketGeneration;
+    this.handshakeTimer = setTimeout(() => {
+      if (generation === this.socketGeneration) this.finishSocket(false, '连接或频道绑定超时，请检查网络后重试', 'AGENT_CONNECT_TIMEOUT');
+    }, 30000);
+    this.openSocket(url, generation).catch(() => {
+      if (generation === this.socketGeneration) this.finishSocket(false);
+    });
+    return ready;
+  }
+
+  private async openSocket(url: string, generation: number): Promise<void> {
     const token: string = await this.readToken();
-    if (!token) { this.finishSocket(false); return false; }
+    if (generation !== this.socketGeneration || !this.socketOpening || this.destroyed) return;
+    if (!token) { this.finishSocket(false, '请先登录后再连接导航服务', 'AUTH_REQUIRED'); return; }
     const deviceId: string = await this.readDeviceId();
-    const socket = webSocket.createWebSocket(); const generation: number = ++this.socketGeneration;
+    if (generation !== this.socketGeneration || !this.socketOpening || this.destroyed) return;
+    const socket = webSocket.createWebSocket();
     this.socket = socket; this.socketOpen = false; this.socketReady = false;
     this.connectSent = false;
-    this.handshakeTimer = setTimeout(() => { if (generation === this.socketGeneration) this.finishSocket(false); }, 15000);
     socket.on('open', () => {
       if (generation !== this.socketGeneration) return;
       this.socketOpen = true;
@@ -232,37 +251,45 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     const options: webSocket.WebSocketRequestOptions = {
       header: { Authorization: `Bearer ${token}`, 'X-Navi-Device-Id': deviceId }
     };
-    try { await socket.connect(url, options); } catch (_) { this.finishSocket(false); }
-    return new Promise<boolean>((resolve) => { if (this.socketReady) resolve(true); else if (!this.socketOpening) resolve(false); else this.readyWaiters.push(resolve); });
+    const connected = await socket.connect(url, options);
+    if (!connected && generation === this.socketGeneration) this.finishSocket(false);
   }
 
   private attachChannelAfterConnect(): void {
+    const generation = this.socketGeneration;
     this.readProfile().then(async (profile: AuthProfile) => {
+      if (generation !== this.socketGeneration || !this.socketOpening) return;
       // A persisted session may belong to a previous account or may have been
       // removed by the server. Retry by route key once instead of turning a
       // stale local id into a permanent "channel binding failed" state.
-      return this.sendChannelAttach(profile.bound_session_id, true);
-    }).catch((error: Object) => this.finishSocket(false, this.errorMessage(error)));
+      return this.sendChannelAttach(profile.bound_session_id, true, generation);
+    }).catch((error: Object) => {
+      if (generation === this.socketGeneration) this.finishSocket(false, this.errorMessage(error));
+    });
   }
 
-  private async sendChannelAttach(requestedSessionId: string, retryWithoutSession: boolean): Promise<void> {
+  private async sendChannelAttach(requestedSessionId: string, retryWithoutSession: boolean, generation: number = this.socketGeneration): Promise<void> {
     const deviceId: string = await this.readDeviceId();
+    if (generation !== this.socketGeneration || !this.socketOpening || this.destroyed) return;
     const attach: ChannelAttachParams = {
       channelId: this.config.naviClawChannelId ?? 'navigation-app',
       peer: { deviceId },
       conversationId: this.conversationId,
-      capabilities: { supports_waypoints: true, max_waypoints: 3, locale: 'zh-CN' },
+      capabilities: { supports_waypoints: true, max_waypoints: MAX_NAVIGATION_WAYPOINTS, locale: 'zh-CN' },
       metadata: { platform: 'harmony', client: 'myapplication' },
       attachMode: 'resume_or_create'
     };
     if (requestedSessionId) attach.sessionId = requestedSessionId;
     this.sendControl('channel.attach', attach, (attached: boolean, payload: Object) => {
+      if (generation !== this.socketGeneration || !this.socketOpening) return;
       if (attached) {
         this.saveBoundSession(payload);
         this.finishSocket(true);
       } else if (requestedSessionId && retryWithoutSession) {
         this.clearBoundSessionId();
-        this.sendChannelAttach('', false).catch((error: Object) => this.finishSocket(false, this.errorMessage(error)));
+        this.sendChannelAttach('', false, generation).catch((error: Object) => {
+          if (generation === this.socketGeneration) this.finishSocket(false, this.errorMessage(error));
+        });
       } else {
         this.finishSocket(false, this.errorMessage(payload));
       }
@@ -277,7 +304,7 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
       return JSON.stringify({ type: 'req', id: requestId, method: 'navigation.feedback', params: feedback });
     }
     const kind: string = request.type === 'candidate_selection' ? 'disambiguation_choice' : request.type === 'cancel' ? 'cancel' : request.kind === 'modify_task' ? 'modify_task' : 'new_intent';
-    const capabilities: NavigationCapabilities = { supports_waypoints: true, max_waypoints: 3, locale: 'zh-CN', supports_feedback: false };
+    const capabilities: NavigationCapabilities = { supports_waypoints: true, max_waypoints: MAX_NAVIGATION_WAYPOINTS, locale: 'zh-CN', supports_feedback: false };
     const params: NavigationSubmitParams = { type: 'navigation', kind, request_id: requestId, session_id: request.session_id, text: request.text, client_capabilities: capabilities, metadata: { client: 'harmony-app', entry: 'kuikly-navigation', action: kind } } as NavigationSubmitParams;
     if (kind === 'modify_task') {
       if (!request.existing_task) throw new Error('修改路线缺少当前导航任务，请重新提交目的地');
@@ -298,9 +325,76 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     return JSON.stringify({ type: 'req', id: requestId, method: 'navigation.submit', params });
   }
   private sendControl(method: string, params: Object, callback?: (ok: boolean, payload: Object) => void): void { const id: string = `sys-${++this.sequence}`; if (callback) this.controlCallbacks.set(id, callback); this.sendOrQueue(JSON.stringify({ type: 'req', id, method, params }), id); }
-  private sendOrQueue(frame: string, requestId: string = ''): void { if (!this.socket || !this.socketOpen || (!this.socketReady && !requestId.startsWith('sys-'))) { this.queuedFrames.push({ frame, requestId }); return; } this.socket.send(frame).catch(() => this.queuedFrames.push({ frame, requestId })); }
+  private sendOrQueue(frame: string, requestId: string): void {
+    if (this.destroyed || (!this.pending.has(requestId) && !this.controlCallbacks.has(requestId))) return;
+    const control = this.controlCallbacks.has(requestId);
+    if (!this.socket || !this.socketOpen || (!this.socketReady && !control)) {
+      if (!this.queuedFrames.some((item: QueuedFrame) => item.requestId === requestId)) this.queuedFrames.push({ frame, requestId });
+      return;
+    }
+    const generation = this.socketGeneration;
+    const socket = this.socket;
+    this.clearWriteTimer(requestId);
+    const writeTimer = setTimeout(() => {
+      if (generation === this.socketGeneration && this.writeTimers.get(requestId) === writeTimer) {
+        this.finishSocket(false, '导航请求发送超时，请检查网络后重试', 'AGENT_SEND_TIMEOUT');
+      }
+    }, 30000);
+    this.writeTimers.set(requestId, writeTimer);
+    try {
+      socket.send(frame).then((sent: boolean) => {
+        if (generation !== this.socketGeneration || this.writeTimers.get(requestId) !== writeTimer) return;
+        this.clearWriteTimer(requestId);
+        if (!this.pending.has(requestId) && !this.controlCallbacks.has(requestId)) return;
+        if (!sent) { this.finishSocket(false, '导航请求发送失败，请检查网络后重试', 'AGENT_SEND_FAILED'); return; }
+        const pending = this.pending.get(requestId);
+        if (pending?.responseTimeoutMs && pending.timer === undefined) {
+          pending.timer = setTimeout(() => this.failPending(requestId, 'AGENT_TIMEOUT', '会话请求超时'), pending.responseTimeoutMs);
+        }
+      }).catch(() => {
+        // Requeueing a failed write without a new connection leaves it stuck,
+        // and replay could duplicate a request already received by the server.
+        if (generation === this.socketGeneration && this.writeTimers.get(requestId) === writeTimer) {
+          this.finishSocket(false, '导航请求发送失败，请检查网络后重试', 'AGENT_SEND_FAILED');
+        }
+      });
+    } catch (_) {
+      if (generation === this.socketGeneration && this.writeTimers.get(requestId) === writeTimer) {
+        this.finishSocket(false, '导航请求发送失败，请检查网络后重试', 'AGENT_SEND_FAILED');
+      }
+    }
+  }
   private flushQueue(): void { const frames: QueuedFrame[] = this.queuedFrames.splice(0); frames.forEach((item: QueuedFrame) => this.sendOrQueue(item.frame, item.requestId)); }
-  private finishSocket(ready: boolean, failureMessage: string = 'navi-claw 连接或频道绑定失败'): void { if (!this.socketOpening && !ready && !this.socketReady) return; if (this.handshakeTimer !== undefined) { clearTimeout(this.handshakeTimer); this.handshakeTimer = undefined; } this.socketOpening = false; this.socketReady = ready; if (!ready) { this.socketOpen = false; this.connectSent = false; } const waiters = this.readyWaiters.splice(0); waiters.forEach((resolve: (ready: boolean) => void) => resolve(ready)); if (ready) this.flushQueue(); else { const pending = Array.from(this.pending.keys()); pending.forEach((id: string) => this.failPending(id, 'AGENT_CONNECT_FAILED', failureMessage)); this.queuedFrames = []; } }
+  private finishSocket(ready: boolean, failureMessage: string = 'navi-claw 连接或频道绑定失败', failureCode: string = 'AGENT_CONNECT_FAILED'): void {
+    if (this.handshakeTimer !== undefined) { clearTimeout(this.handshakeTimer); this.handshakeTimer = undefined; }
+    this.socketOpening = false;
+    this.socketReady = ready;
+    const waiters = this.readyWaiters.splice(0);
+    if (!ready) {
+      // Invalidate all asynchronous authentication, attach and send callbacks
+      // before closing. A late old connection must never revive this channel.
+      ++this.socketGeneration;
+      this.socketOpen = false;
+      this.connectSent = false;
+      const socket = this.socket;
+      this.socket = undefined;
+      if (socket) { try { socket.close().catch(() => {}); } catch (_) {} }
+      this.controlCallbacks.clear();
+      this.writeTimers.forEach((timer: number) => clearTimeout(timer));
+      this.writeTimers.clear();
+      this.queuedFrames = [];
+      const pending = Array.from(this.pending.keys());
+      pending.forEach((id: string) => this.failPending(id, failureCode, failureMessage));
+    }
+    waiters.forEach((resolve: (ready: boolean) => void) => resolve(ready));
+    if (ready) this.flushQueue();
+  }
+
+  private clearWriteTimer(requestId: string): void {
+    const timer = this.writeTimers.get(requestId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.writeTimers.delete(requestId);
+  }
   private saveBoundSession(payload: Object): void { const session: Object | undefined = this.objectField(payload, 'session'); const sessionId: string = session ? this.stringField(session, 'sessionId') : this.stringField(payload, 'sessionId'); this.saveBoundSessionId(sessionId); }
   private saveBoundSessionId(sessionId: string): void { if (!sessionId || !this.context) return; preferences.getPreferences(this.context, KRNavigationAgentModule.TOKEN_STORE).then((store) => store.put('bound_session_id', sessionId).then(() => store.flush())).catch(() => {}); }
   private clearBoundSessionId(): void { if (!this.context) return; preferences.getPreferences(this.context, KRNavigationAgentModule.TOKEN_STORE).then((store) => store.put('bound_session_id', '').then(() => store.flush())).catch(() => {}); }
@@ -328,20 +422,47 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     }
     // state.updated and other gateway events are notifications. Only the
     // response event carries a navigation result that can resolve a request.
-    if (event && event !== 'navigation.response') return;
+    if (event && event !== 'navigation.response') {
+      // A correlated execution event also proves the request reached the
+      // server, even if the OS send promise has not settled yet. It is not the
+      // final result and must not complete or delete the pending call.
+      const progressRequestId = eventPayload ? this.stringField(eventPayload, 'requestId') : '';
+      if (event.startsWith('navigation.') && this.pending.has(progressRequestId)) this.clearWriteTimer(progressRequestId);
+      return;
+    }
+    if (!event && this.stringField(message, 'type') !== 'res') return;
     let id: string = this.stringField(message, 'id');
     let payload: Object | undefined = eventPayload ?? this.objectField(message, 'result') ?? this.objectField(message, 'data');
     if (event === 'navigation.response' && eventPayload) {
       const nested = this.objectField(eventPayload, 'response');
-      if (nested) { payload = nested; id = this.stringField(nested, 'request_id') || this.stringField(nested, 'requestId') || this.stringField(eventPayload, 'requestId'); }
+      if (nested) {
+        payload = nested;
+        // server-ws attaches the transport frame id to the event envelope.
+        id = this.stringField(eventPayload, 'requestId') || this.stringField(nested, 'request_id') || this.stringField(nested, 'requestId');
+      }
     }
     if (!id && payload) id = this.stringField(payload, 'request_id') || this.stringField(payload, 'requestId');
     const errorObject = this.objectField(message, 'error');
+    const failed = !!errorObject || (!event && (message as Record<string, Object>)['ok'] !== true);
     const control = id ? this.controlCallbacks.get(id) : undefined;
-    if (control) { this.controlCallbacks.delete(id); control(!errorObject, payload ?? message); return; }
-    const pending = id ? this.pending.get(id) : undefined; if (!pending) return; this.pending.delete(id); if (pending.timer !== undefined) clearTimeout(pending.timer);
-    if (errorObject) { this.fail(pending.callback, this.stringField(errorObject, 'code') || 'AGENT_REMOTE_ERROR', this.stringField(errorObject, 'message') || '导航服务请求失败'); return; }
-    if (!payload) payload = message;
+    if (control) { this.controlCallbacks.delete(id); this.clearWriteTimer(id); control(!failed, failed ? message : payload ?? message); return; }
+    const pending = id ? this.pending.get(id) : undefined;
+    if (!pending) return;
+    if (!failed && pending.navigationRequest) {
+      const responseRequestId = payload ? this.stringField(payload, 'request_id') || this.stringField(payload, 'requestId') : '';
+      if (!payload || responseRequestId !== pending.requestId) {
+        // An inconsistent notification must not consume the real request. Its
+        // definitive res frame may still follow; malformed res ends visibly.
+        if (!event) this.failPending(id, 'AGENT_RESPONSE_INVALID', '导航响应与当前请求不一致，请重试');
+        return;
+      }
+    }
+    this.pending.delete(id);
+    if (pending.timer !== undefined) clearTimeout(pending.timer);
+    this.clearWriteTimer(id);
+    this.queuedFrames = this.queuedFrames.filter((item: QueuedFrame) => item.requestId !== id);
+    if (failed) { this.fail(pending.callback, errorObject ? this.stringField(errorObject, 'code') || 'AGENT_REMOTE_ERROR' : 'AGENT_REMOTE_ERROR', errorObject ? this.stringField(errorObject, 'message') || '导航服务请求失败' : '导航服务请求失败'); return; }
+    if (!payload) { this.fail(pending.callback, 'AGENT_RESPONSE_INVALID', '导航服务返回的响应为空，请重试'); return; }
     if (pending.persistSessionId) {
       const session = this.objectField(payload, 'session');
       const attachedSessionId: string = session ? this.stringField(session, 'sessionId') : this.stringField(payload, 'sessionId');
@@ -352,8 +473,8 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
     }
     pending.callback(JSON.stringify({ ok: true, response: payload }));
   }
-  private cancel(params: KRAny): void { let requestId: string = ''; try { requestId = this.stringField(JSON.parse(typeof params === 'string' ? params : '{}') as Object, 'request_id'); } catch (_) {} if (requestId) { const pending = this.pending.get(requestId); if (pending?.timer !== undefined) clearTimeout(pending.timer); this.pending.delete(requestId); this.queuedFrames = this.queuedFrames.filter((item: QueuedFrame) => item.requestId !== requestId); } }
-  private closeSocket(): void { this.socketGeneration++; if (this.handshakeTimer !== undefined) { clearTimeout(this.handshakeTimer); this.handshakeTimer = undefined; } this.socketOpening = false; this.socketOpen = false; this.socketReady = false; this.connectSent = false; this.queuedFrames = []; this.controlCallbacks.clear(); const waiters = this.readyWaiters.splice(0); waiters.forEach((resolve: (ready: boolean) => void) => resolve(false)); const pending = Array.from(this.pending.keys()); pending.forEach((id: string) => this.failPending(id, 'AGENT_CLOSED', '导航服务连接已关闭')); if (this.socket) this.socket.close().catch(() => {}); this.socket = undefined; }
+  private cancel(params: KRAny): void { let requestId: string = ''; try { requestId = this.stringField(JSON.parse(typeof params === 'string' ? params : '{}') as Object, 'request_id'); } catch (_) {} if (requestId) { const pending = this.pending.get(requestId); if (pending?.timer !== undefined) clearTimeout(pending.timer); this.pending.delete(requestId); this.clearWriteTimer(requestId); this.queuedFrames = this.queuedFrames.filter((item: QueuedFrame) => item.requestId !== requestId); } }
+  private closeSocket(): void { this.finishSocket(false, '导航服务连接已关闭', 'AGENT_CLOSED'); }
   private gatewayHttpBaseUrl(): string {
     const configured: string = this.config.naviClawWebSocketUrl?.trim() || '';
     if (!configured) return '';
@@ -414,7 +535,7 @@ export class KRNavigationAgentModule extends KuiklyRenderBaseModule {
   private persistProfile(token: string, userId: string, displayName: string, username: string): Promise<void> { if (!this.context || !token) return Promise.resolve(); return preferences.getPreferences(this.context, KRNavigationAgentModule.TOKEN_STORE).then((store) => store.put(KRNavigationAgentModule.TOKEN_KEY, token).then(() => store.put('user_id', userId)).then(() => store.put('display_name', displayName)).then(() => store.put('username', username)).then(() => store.put('bound_session_id', '')).then(() => store.flush())); }
   private clearToken(): Promise<void> { if (!this.context) return Promise.resolve(); return preferences.getPreferences(this.context, KRNavigationAgentModule.TOKEN_STORE).then((store) => store.put(KRNavigationAgentModule.TOKEN_KEY, '').then(() => store.put('user_id', '')).then(() => store.put('display_name', '')).then(() => store.put('username', '')).then(() => store.put('bound_session_id', '')).then(() => store.flush())); }
   private fail(callback: KuiklyRenderCallback | null, code: string, message: string): void { callback?.(JSON.stringify({ ok: false, code, message })); }
-  private failPending(requestId: string, code: string, message: string): void { const pending = this.pending.get(requestId); if (!pending) return; this.pending.delete(requestId); if (pending.timer !== undefined) clearTimeout(pending.timer); this.fail(pending.callback, code, message); }
+  private failPending(requestId: string, code: string, message: string): void { const pending = this.pending.get(requestId); if (!pending) return; this.pending.delete(requestId); if (pending.timer !== undefined) clearTimeout(pending.timer); this.clearWriteTimer(requestId); this.queuedFrames = this.queuedFrames.filter((item: QueuedFrame) => item.requestId !== requestId); this.fail(pending.callback, code, message); }
   private stringField(value: Object, key: string): string { const item: Object = (value as Record<string, Object>)[key]; return typeof item === 'string' ? item : ''; }
   private objectField(value: Object, key: string): Object | undefined { const item: Object = (value as Record<string, Object>)[key]; return item !== null && typeof item === 'object' ? item : undefined; }
   private numberField(value: Object, key: string): number { const item: Object = (value as Record<string, Object>)[key]; return typeof item === 'number' ? item : Number.NaN; }

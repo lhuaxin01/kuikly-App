@@ -1,6 +1,7 @@
 import { bundleManager, common } from '@kit.AbilityKit';
 import hilog from '@ohos.hilog';
 import { NavigationController } from '../domain/NavigationController';
+import { MAX_NAVIGATION_WAYPOINTS } from '../domain/NavigationCapabilities';
 import { GeoPoint, NavigationDestination, NavigationPhase, NavigationSnapshot, validPoint } from '../domain/NavigationModels';
 import { NavigationConfig } from './NavigationConfig';
 import { AmapNavigationEngine } from './AmapNavigationEngine';
@@ -69,6 +70,10 @@ export class HarmonyNavigationSession {
   /** Context bridge for platform modules that own HTTP, WebSocket and token storage. */
   getContext(): common.UIAbilityContext { return this.context; }
 
+  setVoiceInputActive(active: boolean): void {
+    if (!this.disposed) this.engine.setVoiceInputActive(active);
+  }
+
   subscribe(callback: (json: string) => void): void {
     if (this.disposed) throw new Error('导航页面已关闭');
     this.events = callback;
@@ -76,7 +81,7 @@ export class HarmonyNavigationSession {
     try { appId = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_SIGNATURE_INFO).signatureInfo.appId; }
     catch (_) { appId = '当前环境无法读取'; }
     const event: SessionEvent = {
-      type: 'environment', keyConfigured: this.config.apiKey.length > 0, appId, maxWaypoints: 3,
+      type: 'environment', keyConfigured: this.config.apiKey.length > 0, appId, maxWaypoints: MAX_NAVIGATION_WAYPOINTS,
       configSource: this.config.source, keyHint: maskedAmapKey(this.config.apiKey), naviSdkVersion: '11.2.0',
       travelModes: ['drive', 'walk', 'ride'],
       destination: { name: this.config.destination.name, latitude: this.config.destination.point.latitude,
@@ -109,7 +114,9 @@ export class HarmonyNavigationSession {
         }
         const destination = this.place(command.destination);
         const waypoints = command.waypoints ?? [];
-        if (!Array.isArray(waypoints) || waypoints.length > 3) throw new Error('最多支持 3 个途经点');
+        if (!Array.isArray(waypoints) || waypoints.length > MAX_NAVIGATION_WAYPOINTS) {
+          throw new Error(`最多支持 ${MAX_NAVIGATION_WAYPOINTS} 个途经点`);
+        }
         const points: GeoPoint[] = waypoints.map((item: BridgePlace) => this.place(item).point);
         const revision = command.revision;
         if (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 0) throw new Error('路线版本无效');

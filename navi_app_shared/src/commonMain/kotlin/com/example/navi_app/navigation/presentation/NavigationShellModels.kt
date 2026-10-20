@@ -10,6 +10,7 @@ enum class NavigationTab {
 data class NavigationInputState(
     val text: String = "",
     val micListening: Boolean = false,
+    val voiceActive: Boolean = false,
     val submitting: Boolean = false,
     val analyzing: Boolean = false,
     val error: String = ""

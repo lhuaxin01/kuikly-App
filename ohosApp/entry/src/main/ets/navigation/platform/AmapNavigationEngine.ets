@@ -35,6 +35,7 @@ export class AmapNavigationEngine implements NavigationEngine {
   private routeGeneration: number = 0;
   private guiding: boolean = false;
   private starting: boolean = false;
+  private voiceInputActive: boolean = false;
   private simulation: boolean = false;
   private locating: boolean = false;
   private ownsInstance: boolean = false;
@@ -325,7 +326,7 @@ export class AmapNavigationEngine implements NavigationEngine {
         (this.map?.getCameraPosition()?.bearing ?? 0);
     }
     this.updateCameraGestures();
-    this.navi.setUseInnerVoice(true, true);
+    this.navi.setUseInnerVoice(!this.voiceInputActive, true);
     if (simulation) this.navi.stopGPS();
     // IAMapNavi 11.2 explicitly guarantees that startNavi(GPS) starts satellite
     // positioning, including after exitGuidance stopped it. Let this result
@@ -334,6 +335,19 @@ export class AmapNavigationEngine implements NavigationEngine {
       this.starting = false;
       this.updateCameraGestures();
       throw new Error('导航启动失败');
+    }
+  }
+
+  setVoiceInputActive(active: boolean): void {
+    if (this.voiceInputActive === active) return;
+    this.voiceInputActive = active;
+    // ASR must not transcribe the navigation engine's own instructions.
+    // Finishing input after exit/stop must never restart navigation speech.
+    if (this.navi) {
+      if (active) this.navi.stopSpeak();
+      const resume = !active && (this.guiding || this.starting);
+      this.navi.setUseInnerVoice(resume, true);
+      if (resume) this.navi.startSpeak();
     }
   }
 
@@ -403,6 +417,7 @@ export class AmapNavigationEngine implements NavigationEngine {
   }
 
   release(): string[] {
+    this.voiceInputActive = false;
     this.traceMap('release');
     ++this.generation;
     ++this.navigationGeneration;

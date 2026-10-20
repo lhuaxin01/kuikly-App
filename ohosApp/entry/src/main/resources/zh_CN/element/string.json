@@ -1,6 +1,10 @@
 {
   "string": [
     {
+      "name": "navigation_microphone_reason",
+      "value": "用于在点击语音输入时识别您说出的目的地和途经地点"
+    },
+    {
       "name": "module_desc",
       "value": "地图与导航"
     },

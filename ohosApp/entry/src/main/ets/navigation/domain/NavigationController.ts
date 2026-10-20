@@ -1,4 +1,5 @@
 import { NavigationClock, NavigationEngine, NavigationEngineListener } from './NavigationEngine';
+import { MAX_NAVIGATION_WAYPOINTS } from './NavigationCapabilities';
 import {
   GeoPoint, MapContentStatus, NavigationDestination, NavigationLocation, NavigationPhase, NavigationProgress,
   NavigationRoute, NavigationSnapshot, validPoint
@@ -192,7 +193,7 @@ export class NavigationController {
   plan(destination: NavigationDestination, waypoints: GeoPoint[] = [], travelMode: string = 'drive'): void {
     if (this.disposed || (this.state.phase !== NavigationPhase.LocationReady &&
       this.state.phase !== NavigationPhase.RouteReady)) return;
-    if (!validPoint(destination.point) || !destination.name.trim() || waypoints.length > 3 ||
+    if (!validPoint(destination.point) || !destination.name.trim() || waypoints.length > MAX_NAVIGATION_WAYPOINTS ||
       waypoints.some((point: GeoPoint) => !validPoint(point))) {
       this.fail('起终点或途经点配置无效，请检查 GCJ-02 经纬度和数量');
       return;

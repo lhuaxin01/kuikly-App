@@ -765,18 +765,21 @@ test('editing a planned route removes its overlay and requires replanning', asyn
   assert.equal(f.controller.snapshot().route, undefined, 'late route cannot restore a cleared preview');
 });
 
-test('waypoints are passed in order and platform limits are enforced', async () => {
-  const f = fixture();
-  await ready(f);
-  f.controller.locate(); f.engine.listener.onLocation(location(f));
-  const waypoints = [new GeoPoint(39.98, 116.31), new GeoPoint(39.99, 116.32)];
-  f.controller.plan(destination, waypoints);
-  assert.deepEqual(f.engine.plannedWaypoints, waypoints);
-  f.engine.listener.onRoute(route);
-  f.controller.plan(destination, [...waypoints, ...waypoints]);
-  assert.equal(f.controller.snapshot().phase, Phase.Error);
-  assert.equal(f.engine.calls.filter(call => call[0] === 'plan').length, 1);
-});
+for (const mode of ['drive', 'walk', 'ride']) {
+  test(`${mode} accepts ten ordered waypoints and rejects eleven before SDK calculation`, async () => {
+    const f = fixture();
+    await ready(f);
+    f.controller.locate(); f.engine.listener.onLocation(location(f));
+    const waypoints = Array.from({ length: 10 }, (_, index) => new GeoPoint(39.98 + index * 0.001, 116.31));
+    f.controller.plan(destination, waypoints, mode);
+    assert.deepEqual(f.engine.plannedWaypoints, waypoints);
+    assert.equal(f.engine.plannedTravelMode, mode);
+    f.engine.listener.onRoute(route);
+    f.controller.plan(destination, [...waypoints, new GeoPoint(40, 116.4)], mode);
+    assert.equal(f.controller.snapshot().phase, Phase.Error);
+    assert.equal(f.engine.calls.filter(call => call[0] === 'plan').length, 1);
+  });
+}
 
 test('arrival can reuse the base map without accepting old progress', async () => {
   const f = fixture();

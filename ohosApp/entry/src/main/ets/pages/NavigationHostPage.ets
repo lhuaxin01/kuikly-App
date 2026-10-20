@@ -25,13 +25,23 @@ struct NavigationHostPage {
     } catch (error) { this.failure = (error as Error).message; }
   }
   onPageShow(): void { this.delegate?.pageDidAppear(); }
-  onPageHide(): void { this.session?.stop('已离开导航页面'); this.delegate?.pageDidDisappear(); }
+  onPageHide(): void {
+    this.delegate?.cancelVoiceInput();
+    this.session?.stop('已离开导航页面');
+    this.delegate?.pageDidDisappear();
+  }
   onBackPress(): boolean {
+    this.delegate?.cancelVoiceInput();
     if (this.session?.exitGuidance()) return true;
     this.session?.stop('已退出导航页面');
     return false;
   }
-  aboutToDisappear(): void { this.ready = false; this.session?.dispose(); this.session = undefined; }
+  aboutToDisappear(): void {
+    this.ready = false;
+    this.delegate?.disposeVoiceInput();
+    this.session?.dispose();
+    this.session = undefined;
+  }
 
   build() {
     Stack() {
@@ -39,6 +49,7 @@ struct NavigationHostPage {
         Kuikly({
           pagerName: 'navigation', pagerData: {}, delegate: this.delegate, nativeManager: globalNativeManager,
           onRenderException: (error: Error, reason: ErrorReason) => {
+            this.delegate?.cancelVoiceInput();
             this.session?.stop('页面渲染异常，导航已停止');
             this.failure = `导航页面加载失败：${error.message}`;
           }

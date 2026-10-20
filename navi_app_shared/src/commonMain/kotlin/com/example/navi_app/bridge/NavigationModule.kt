@@ -33,7 +33,7 @@ class NavigationModule : Module(), NavigationPort {
                         onEnvironment(NavigationEnvironment(Place(point.optString("name"), GeoPoint(
                             point.optDouble("latitude", Double.NaN), point.optDouble("longitude", Double.NaN))),
                             event.optBoolean("keyConfigured"), event.optString("appId"),
-                            NavigationCapabilities(event.optInt("maxWaypoints", 3).coerceAtLeast(0), modes),
+                            NavigationCapabilities(event.optInt("maxWaypoints", NavigationCapabilities.DEFAULT_MAX_WAYPOINTS).coerceAtLeast(0), modes),
                             configSource = event.optString("configSource"), keyHint = event.optString("keyHint"),
                             naviSdkVersion = event.optString("naviSdkVersion")))
                     }

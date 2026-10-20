@@ -98,6 +98,8 @@ function fixture() {
     stopGPS() { lifecycle.push('stopGPS'); },
     startGPS() { lifecycle.push('startGPS'); return true; },
     setUseInnerVoice(enabled) { lifecycle.push(enabled ? 'voiceOn' : 'voiceOff'); },
+    stopSpeak() { lifecycle.push('stopSpeak'); },
+    startSpeak() { lifecycle.push('startSpeak'); },
     addAMapNaviListener(listener) { listeners.push(listener); },
     removeAMapNaviListener() { lifecycle.push('removeListener'); },
     stopNavi() { lifecycle.push('stopNavi'); },
@@ -233,6 +235,27 @@ const success = () => ({ errorCode: 0, routeId: [7, 9] });
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const fix = (latitude = 39.981, longitude = 116.302, bearing = 90, speed = 5, accuracy = 8) => ({
   coord: { latitude, longitude }, accuracy, bearing, speed, locationType: 0
+});
+
+test('voice input suppresses navigation speech and restores it only while guidance remains active', async () => {
+  const f = fixture(); await f.ready(); begin(f); f.engine.start(false); f.sdkListener.onStartNavi();
+  f.engine.setVoiceInputActive(true);
+  assert.equal(f.lifecycle.at(-1), 'voiceOff');
+  assert.equal(f.lifecycle.at(-2), 'stopSpeak');
+  f.engine.setVoiceInputActive(false);
+  assert.equal(f.lifecycle.at(-2), 'voiceOn');
+  assert.equal(f.lifecycle.at(-1), 'startSpeak');
+  f.engine.setVoiceInputActive(true); f.engine.exitGuidance(); f.engine.setVoiceInputActive(false);
+  assert.equal(f.lifecycle.at(-1), 'voiceOff', 'input completion cannot resume exited navigation speech');
+});
+
+test('navigation started during voice input stays muted until input ends', async () => {
+  const f = fixture(); await f.ready(); begin(f); f.engine.setVoiceInputActive(true);
+  const before = f.lifecycle.length; f.engine.start(false);
+  assert.ok(!f.lifecycle.slice(before).includes('voiceOn'));
+  f.engine.setVoiceInputActive(false);
+  assert.equal(f.lifecycle.at(-2), 'voiceOn');
+  assert.equal(f.lifecycle.at(-1), 'startSpeak');
 });
 
 test('guidance immediately leaves the route overview and smoothly tracks real street-level fixes', async () => {

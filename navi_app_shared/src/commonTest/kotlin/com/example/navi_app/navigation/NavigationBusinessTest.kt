@@ -134,7 +134,8 @@ class NavigationBusinessTest {
         assertEquals("请选择目的地：北京大学\n请选择目的地", store.state.candidateQuestion)
         store.chooseCandidate(candidate)
         assertEquals(listOf("group-1:poi-1"), selected)
-        assertNull(store.state.candidateGroup)
+        assertEquals("group-1", store.state.candidateGroup?.id)
+        assertTrue(store.state.busy)
     }
     @Test fun malformedCompletionFlagIsNotTreatedAsLegacy() {
         val json = JSONObject("""{"status":"ok","response_type":"navigation_task","task_complete":"invalid","task":{"stops":[{"role":"destination","poi":{"location":{"lat":39.0,"lng":116.0}}}]}}""")
@@ -177,11 +178,10 @@ class NavigationBusinessTest {
         assertTrue(unsupported.isUnsupported())
         assertEquals("暂不支持该请求", assertIs<ResponseAction.ShowMessage>(NavigationResponseCoordinator.resolve(unsupported)).text)
     }
-    @Test fun draftDeduplicatesWaypointsAndHonoursPlatformLimit() {
-        val draft = NavigationDraft(place).withWaypoint(place, 1)
-        assertFailsWith<IllegalArgumentException> { draft.withWaypoint(place, 1) }
-        assertFailsWith<IllegalArgumentException> { draft.withWaypoint(Place("第二个", GeoPoint(40.0, 116.0)), 1) }
-        assertEquals(1, draft.waypoints.size)
+    @Test fun agentWaypointsHonourTheAdvertisedPlatformLimit() {
+        val draft = NavigationDraft(place, itineraryPoints(2))
+        assertNotNull(draft.validate(NavigationCapabilities(maxWaypoints = 1)))
+        assertNull(draft.validate(NavigationCapabilities(maxWaypoints = 2)))
     }
     @Test fun unsupportedModesRemainRejectedAndExplicitOriginFallsBackToLiveLocation() {
         assertNotNull(NavigationDraft(place, travelMode = TravelMode.WALK).validate(NavigationCapabilities()))
@@ -209,12 +209,13 @@ class NavigationBusinessTest {
         val port = FakePort()
         val store = store(port)
         val destination = Place("故宫博物院东华门", GeoPoint(39.9161, 116.4038))
+        store.setInputText("请带我去故宫博物院东华门")
         store.acceptResponse(response(stops = listOf(NavigationStop("destination", destination.name, destination.point))))
         val revision = store.state.draftRevision
-        assertEquals(destination.name, store.state.shell.input.text)
+        assertEquals("请带我去故宫博物院东华门", store.state.shell.input.text)
         repeat(2) { store.configure(NavigationEnvironment(place, true, "renewed-app-id")) }
         assertEquals(destination, store.state.draft.destination)
-        assertEquals(destination.name, store.state.shell.input.text)
+        assertEquals("请带我去故宫博物院东华门", store.state.shell.input.text)
         assertEquals(revision, store.state.draftRevision)
         store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
         assertEquals(1, port.plans)
@@ -249,13 +250,13 @@ class NavigationBusinessTest {
         val target = GeoPoint(39.9161, 116.4038)
         store.acceptResponse(response(stops = listOf(NavigationStop("destination", "故宫博物院东华门", target))))
         assertFalse(store.state.resolvingDestination)
-        assertEquals("故宫博物院东华门", store.state.shell.input.text)
+        assertEquals("去故宫博物院东华门", store.state.shell.input.text)
         assertEquals(1, port.plans)
         assertEquals(target, port.plannedDraft!!.destination!!.point)
         assertEquals(oldRevision + 1, port.revision)
         assertFalse(store.state.canStart)
     }
-    @Test fun modeAndWaypointEditsDoNotConfirmAnUnresolvedDestination() {
+    @Test fun modeChangesDoNotConfirmAnUnresolvedDestination() {
         val port = FakePort()
         val store = store(port)
         store.configure(NavigationEnvironment(place, true, "test-app-id",
@@ -267,7 +268,6 @@ class NavigationBusinessTest {
         store.beginDestinationRequest()
         store.setInputError("有多个同名地点，请进一步说明")
         store.selectTravelMode(TravelMode.WALK)
-        store.clearWaypoints()
         assertEquals(TravelMode.WALK, store.state.draft.travelMode)
         assertEquals(place, store.state.draft.destination)
         assertEquals("去附近的图书馆", store.state.shell.input.text)
@@ -311,6 +311,7 @@ class NavigationBusinessTest {
             store.restoreDestination()
             store.runtime(RuntimeSnapshot(phase = phase, location = point))
             val target = Place("故宫博物院", GeoPoint(39.9163, 116.3972))
+            store.setInputText("改去故宫博物院")
             port.onStop = {
                 assertEquals(place, store.state.draft.destination)
                 assertTrue(store.state.resolvingDestination)
@@ -322,7 +323,7 @@ class NavigationBusinessTest {
             assertEquals(1, port.stops)
             assertEquals(1, port.opens)
             assertEquals(target, store.state.draft.destination)
-            assertEquals(target.name, store.state.shell.input.text)
+            assertEquals("改去故宫博物院", store.state.shell.input.text)
             assertFalse(store.state.resolvingDestination)
             assertEquals(0, port.plans)
             store.runtime(RuntimeSnapshot(phase = EnginePhase.MAP_READY))
@@ -396,7 +397,7 @@ class NavigationBusinessTest {
         val latestDestination = Place("天安门广场", GeoPoint(39.9054, 116.3976))
         store.acceptResponse(response(stops = listOf(NavigationStop("destination", latestDestination.name, latestDestination.point))))
         assertEquals(latestDestination, store.state.draft.destination)
-        assertEquals(latestDestination.name, store.state.shell.input.text)
+        assertEquals("现在改去天安门广场", store.state.shell.input.text)
         assertEquals(1, port.opens)
         store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
         assertEquals(1, port.plans)
@@ -724,6 +725,8 @@ class NavigationBusinessTest {
         assertEquals("正在确认地点…", store.state.busyMessage)
         assertFalse(store.state.canSubmit)
         store.setInputError("候选确认网络失败，请重新输入")
+        assertEquals("group-1", store.state.candidateGroup?.id)
+        assertTrue(store.state.candidateQuestion.isNotBlank())
         assertFalse(store.state.busy)
         assertTrue(store.state.canSubmit)
         assertTrue(store.state.resolvingDestination)
@@ -824,6 +827,298 @@ class NavigationBusinessTest {
         store.start(false)
         store.runtime(navigating)
         assertFalse(store.state.overview, "new navigation starts with the current-position camera")
+    }
+    @Test fun tenWaypointsAreAcceptedInEveryAdvertisedTravelModeInTheirOriginalOrder() {
+        assertEquals(10, NavigationCapabilities().maxWaypoints)
+        val waypoints = itineraryPoints(10)
+        for (mode in TravelMode.entries) {
+            val port = FakePort()
+            val store = store(port)
+            val capabilities = NavigationCapabilities(travelModes = TravelMode.entries.toSet())
+            assertNull(NavigationDraft(place, waypoints, mode).validate(capabilities))
+            store.configure(NavigationEnvironment(place, true, "test-app-id", capabilities))
+            store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
+            store.acceptResponse(itineraryResponse(waypoints, mode))
+            assertEquals(1, port.plans)
+            assertEquals(waypoints, port.plannedDraft!!.waypoints)
+            assertEquals(place, port.plannedDraft!!.destination)
+            assertEquals(mode, port.plannedDraft!!.travelMode)
+        }
+    }
+    @Test fun tooManyWaypointsRejectTheWholeNewTaskWithoutSilentlyDroppingStops() {
+        val port = FakePort()
+        val store = itineraryStore(port)
+        val originalDraft = store.state.draft
+        val originalRoute = store.state.runtime.route
+        val originalRevision = store.state.draftRevision
+        val clears = port.clears
+        val plans = port.plans
+        val excessive = itineraryPoints(11)
+        assertTrue(NavigationDraft(place, excessive).validate(NavigationCapabilities())!!.contains("10"))
+        store.acceptResponse(itineraryResponse(excessive))
+        assertEquals(originalDraft, store.state.draft)
+        assertEquals(originalRoute, store.state.runtime.route)
+        assertEquals(originalRevision, store.state.draftRevision)
+        assertEquals(plans, port.plans)
+        assertEquals(clears, port.clears)
+        assertTrue(store.state.notice.contains("10"))
+    }
+    @Test fun adjacentDuplicateStopsAreRejectedEvenWhenTheirNamesDiffer() {
+        val points = itineraryPoints(2)
+        val duplicate = points.first().copy(name = "同一坐标的别名")
+        assertTrue(NavigationDraft(place, listOf(points.first(), duplicate))
+            .validate(NavigationCapabilities())!!.contains("相邻地点重复"))
+        assertTrue(NavigationDraft(points.last(), points)
+            .validate(NavigationCapabilities())!!.contains("相邻地点重复"))
+    }
+    @Test fun nonAdjacentReturnVisitsAreKeptAsDistinctLegs() {
+        val points = itineraryPoints(2)
+        val returnVisit = listOf(points[0], points[1], points[0])
+        assertNull(NavigationDraft(place, returnVisit).validate(NavigationCapabilities()))
+        val port = FakePort()
+        val store = store(port)
+        store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
+        store.acceptResponse(itineraryResponse(returnVisit))
+        assertEquals(returnVisit, store.state.draft.waypoints)
+        assertEquals(returnVisit, port.plannedDraft!!.waypoints)
+        assertEquals(place, port.plannedDraft!!.destination)
+    }
+    @Test fun agentReplacesWaypointOrderAndPreservesTheFullInputAcrossReplanning() {
+        val port = FakePort()
+        val store = itineraryStore(port)
+        val previous = store.state.draft
+        val oldRevision = store.state.draftRevision
+        val oldPreview = preview(store)
+        val plans = port.plans
+        val clears = port.clears
+        val request = "先去第三站，再去第一站，取消第二站，最后到终点"
+        store.setInputText(request)
+        store.beginDestinationRequest()
+        store.setInputSubmitting(true)
+        val newOrder = listOf(previous.waypoints[2], previous.waypoints[0])
+        port.onClearRoute = { store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point)) }
+        store.acceptResponse(itineraryResponse(newOrder))
+        assertEquals(newOrder, store.state.draft.waypoints)
+        assertEquals(previous.destination, store.state.draft.destination)
+        assertEquals(request, store.state.shell.input.text)
+        assertEquals(oldRevision + 1, store.state.draftRevision)
+        assertNull(store.state.runtime.route)
+        assertFalse(store.state.canStart)
+        assertEquals(clears + 1, port.clears)
+        assertEquals(plans + 1, port.plans)
+        assertEquals(store.state.draft, port.plannedDraft)
+        store.runtime(oldPreview)
+        store.start(false)
+        assertEquals(0, port.starts)
+        assertFalse(store.state.canStart)
+        store.runtime(preview(store))
+        assertTrue(store.state.canStart)
+        assertEquals(request, store.state.shell.input.text)
+    }
+    @Test fun agentCanRemoveAllWaypointsWithoutReplacingTheInputWithTheDestinationName() {
+        val port = FakePort()
+        val store = itineraryStore(port)
+        val previous = store.state.draft
+        val plans = port.plans
+        store.setInputText("取消所有途经点，直接到终点")
+        store.beginDestinationRequest()
+        store.acceptResponse(itineraryResponse(emptyList()))
+        assertTrue(store.state.draft.waypoints.isEmpty())
+        assertEquals(previous.destination, store.state.draft.destination)
+        assertEquals(plans + 1, port.plans)
+        assertTrue(port.plannedDraft!!.waypoints.isEmpty())
+        assertEquals("取消所有途经点，直接到终点", store.state.shell.input.text)
+    }
+    @Test fun mapDestinationSelectionAndTravelModeChangesKeepAgentWaypointOrder() {
+        val port = FakePort()
+        val store = itineraryStore(port)
+        val waypoints = store.state.draft.waypoints
+        store.configure(NavigationEnvironment(place, true, "test-app-id",
+            NavigationCapabilities(travelModes = TravelMode.entries.toSet())))
+        store.selectPoint(GeoPoint(40.0, 116.0))
+        assertEquals(waypoints, store.state.draft.waypoints)
+        store.selectTravelMode(TravelMode.WALK)
+        assertEquals(waypoints, store.state.draft.waypoints)
+    }
+    @Test fun candidateConfirmationPreservesTheOriginalMultiStopInput() {
+        val port = FakePort()
+        val store = store(port)
+        store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
+        val request = "先去图书馆，再去公园，最后去车站"
+        store.setInputText(request)
+        store.beginDestinationRequest()
+        store.setInputSubmitting(true)
+        val candidate = Candidate("station", "车站东门", "站前路", point)
+        store.acceptResponse(response().copy(responseType = "disambiguation",
+            candidateGroups = listOf(CandidateGroup("station-group", 2, listOf(candidate)))))
+        store.setInputSubmitting(false)
+        store.setCandidateSelectionHandler { _, _ -> store.setInputSubmitting(true, analyzing = false) }
+        store.chooseCandidate(candidate)
+        store.acceptResponse(itineraryResponse(itineraryPoints(2)))
+        assertEquals(request, store.state.shell.input.text)
+        assertEquals(itineraryPoints(2), port.plannedDraft!!.waypoints)
+    }
+    @Test fun activeVoiceLocksRouteActionsWithoutHidingTheVoiceStopControl() {
+        val port = FakePort()
+        val store = itineraryStore(port)
+        val originalDraft = store.state.draft
+        val revision = store.state.draftRevision
+        val plans = port.plans
+        val clears = port.clears
+        store.updateShell { it.copy(input = it.input.copy(voiceActive = true, micListening = true)) }
+        assertFalse(store.state.canSubmit)
+        assertTrue(store.state.canSendInput, "manual Send must remain reachable during dictation")
+        assertFalse(store.state.canPlan)
+        assertFalse(store.state.canStart)
+        assertFalse(store.state.canEdit)
+        assertFalse(store.state.canLocate)
+        assertFalse(store.state.busy, "voice activity must not replace the microphone control with the route-loading bar")
+        store.plan()
+        store.start(false)
+        store.start(true)
+        store.locate()
+        store.selectPoint(GeoPoint(40.0, 116.0))
+        assertEquals(originalDraft, store.state.draft)
+        assertEquals(revision, store.state.draftRevision)
+        assertEquals(plans, port.plans)
+        assertEquals(clears, port.clears)
+        assertEquals(0, port.starts)
+        assertEquals(0, port.locates)
+        // Capture has stopped, but final transcription still owns the input.
+        store.updateShell { it.copy(input = it.input.copy(micListening = false)) }
+        assertFalse(store.state.canSubmit)
+        assertFalse(store.state.busy)
+        store.updateShell { it.copy(input = it.input.copy(voiceActive = false)) }
+        assertTrue(store.state.canSubmit)
+        assertTrue(store.state.canPlan)
+        assertTrue(store.state.canStart)
+        assertTrue(store.state.canEdit)
+        assertTrue(store.state.canLocate)
+    }
+    @Test fun voiceInputDefersCandidateSelectionUntilDictationFinishes() {
+        val port = FakePort()
+        val store = store(port)
+        val candidate = Candidate("poi-voice", "公园东门", "公园路", point)
+        val selected = mutableListOf<String>()
+        store.setCandidateSelectionHandler { group, id -> selected += "$group:$id" }
+        store.acceptResponse(response().copy(responseType = "disambiguation",
+            candidateGroups = listOf(CandidateGroup("group-voice", 0, listOf(candidate)))))
+        store.updateShell { it.copy(input = it.input.copy(voiceActive = true)) }
+        store.chooseCandidate(candidate)
+        assertTrue(selected.isEmpty())
+        assertNotNull(store.state.candidateGroup)
+        assertFalse(store.state.busy)
+        store.updateShell { it.copy(input = it.input.copy(voiceActive = false)) }
+        store.chooseCandidate(candidate)
+        assertEquals(listOf("group-voice:poi-voice"), selected)
+        assertEquals("group-voice", store.state.candidateGroup?.id)
+        assertTrue(store.state.busy)
+    }
+
+    @Test fun multipleWaypointAndDestinationChoicesPlanOnlyAfterAllServerConfirmations() {
+        val port = FakePort()
+        val store = store(port)
+        store.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
+        val text = "先去咖啡店，再去图书馆，最后到公园"
+        store.setInputText(text)
+        store.beginDestinationRequest()
+        val candidates = listOf(
+            Candidate("coffee", "咖啡店南门", "南街", GeoPoint(39.91, 116.31)),
+            Candidate("library", "图书馆东门", "东街", GeoPoint(39.92, 116.32)),
+            Candidate("park", "公园北门", "北街", GeoPoint(39.93, 116.33)))
+        val groups = candidates.mapIndexed { index, candidate -> CandidateGroup("group-$index", index, listOf(candidate)) }
+        val selected = mutableListOf<String>()
+        store.setCandidateSelectionHandler { group, candidate -> selected += "$group:$candidate" }
+        fun partial(confirmed: Int) = NavigationTask(candidates.mapIndexed { index, candidate ->
+            NavigationStop(if (index == 2) "destination" else "waypoint", candidate.name,
+                if (index < confirmed) candidate.point else null, index >= confirmed)
+        })
+        for (index in candidates.indices) {
+            store.acceptResponse(response().copy(responseType = "disambiguation", taskComplete = false,
+                partialTask = partial(index), candidateGroups = groups.drop(index).reversed()))
+            assertEquals(groups[index], store.state.candidateGroup)
+            assertEquals(3 - index, store.state.candidateGroups.size)
+            assertEquals(index, store.state.candidateTask!!.stops.count { !it.needsConfirmation })
+            assertFalse(store.state.busy)
+            store.chooseCandidate(candidates[index], groups[index].id)
+            store.chooseCandidate(candidates[index], groups[index].id)
+            assertEquals(index + 1, selected.size, "a second tap must not submit the same choice again")
+            assertEquals(groups[index], store.state.candidateGroup, "retain the snapshot while waiting")
+            assertEquals(0, port.plans)
+            assertFalse(store.state.canStart)
+        }
+        store.acceptResponse(response().copy(task = partial(3)))
+        assertEquals(1, port.plans)
+        assertEquals(candidates.take(2).map { it.name }, port.plannedDraft!!.waypoints.map { it.name })
+        assertEquals(candidates.last().name, port.plannedDraft!!.destination!!.name)
+        assertNull(store.state.candidateGroup)
+        assertNull(store.state.candidateTask)
+        assertTrue(store.state.candidateGroups.isEmpty())
+        assertEquals(text, store.state.shell.input.text)
+    }
+
+    @Test fun failedChoiceKeepsContextAndAllowsExplicitRetryWithoutAdvancing() {
+        val store = store(FakePort())
+        val item = Candidate("poi", "公园南门", "南街", point)
+        val group = CandidateGroup("group", 0, listOf(item))
+        val partial = NavigationTask(listOf(NavigationStop("destination", "公园", null, true)))
+        store.acceptResponse(response().copy(responseType = "disambiguation", partialTask = partial,
+            candidateGroups = listOf(group)))
+        var requests = 0
+        store.setCandidateSelectionHandler { _, _ -> requests++ }
+        store.chooseCandidate(item, group.id)
+        store.setInputError("网络已断开，请重试")
+        assertEquals(group, store.state.candidateGroup)
+        assertEquals(partial, store.state.candidateTask)
+        assertFalse(store.state.busy)
+        store.chooseCandidate(item, group.id)
+        assertEquals(2, requests)
+        store.acceptResponse(response().copy(status = "error", responseType = "error", errorMessage = "服务繁忙"))
+        assertEquals(group, store.state.candidateGroup)
+        assertFalse(store.state.busy)
+        assertEquals("服务繁忙", store.state.notice)
+    }
+
+    @Test fun staleCandidateCardCannotChooseAnItemForTheNextStop() {
+        val store = store(FakePort())
+        val item = Candidate("same-poi", "相同候选地点", "同一路", point)
+        val current = CandidateGroup("new-group", 1, listOf(item))
+        store.acceptResponse(response().copy(responseType = "disambiguation", candidateGroups = listOf(current)))
+        var requests = 0
+        store.setCandidateSelectionHandler { _, _ -> requests++ }
+        store.chooseCandidate(item, "old-group")
+        store.chooseCandidate(item.copy(id = "foreign-poi"), current.id)
+        assertEquals(0, requests)
+        assertFalse(store.state.busy)
+        store.chooseCandidate(item, current.id)
+        assertEquals(1, requests)
+    }
+
+    @Test fun newIntentOrCancellationClearsThePreviousCandidateProgress() {
+        val store = store(FakePort())
+        val group = CandidateGroup("group", 0, listOf(Candidate("poi", "公园", "东街", point)))
+        val response = response().copy(responseType = "disambiguation", partialTask = NavigationTask(
+            listOf(NavigationStop("destination", "公园", null, true))), candidateGroups = listOf(group))
+        for (cancel in listOf(false, true)) {
+            store.acceptResponse(response)
+            if (cancel) store.stop() else store.beginDestinationRequest()
+            assertNull(store.state.candidateGroup)
+            assertNull(store.state.candidateTask)
+            assertTrue(store.state.candidateGroups.isEmpty())
+        }
+    }
+    private fun itineraryPoints(count: Int) = (0 until count).map { index ->
+        Place("途经地点 ${index + 1}", GeoPoint(39.8 + index * 0.001, 116.2 + index * 0.001))
+    }
+    private fun itineraryResponse(waypoints: List<Place>, mode: TravelMode = TravelMode.DRIVE) =
+        response(stops = waypoints.map { NavigationStop("waypoint", it.name, it.point) } +
+            NavigationStop("destination", place.name, place.point)).let {
+            it.copy(task = it.task!!.copy(travelMode = mode.wireValue))
+        }
+    private fun itineraryStore(port: FakePort) = store(port).also {
+        it.runtime(RuntimeSnapshot(phase = EnginePhase.LOCATION_READY, location = point))
+        it.acceptResponse(itineraryResponse(itineraryPoints(3)))
+        it.runtime(preview(it))
     }
     private fun preview(store: NavigationStore) = RuntimeSnapshot(phase = EnginePhase.ROUTE_READY,
         location = point, route = RouteSummary(12, 1000.0, 60.0), routeRevision = store.state.draftRevision)

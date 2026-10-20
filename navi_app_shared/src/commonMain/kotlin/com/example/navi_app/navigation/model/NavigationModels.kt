@@ -36,4 +36,6 @@ data class RuntimeSnapshot(
     val routeRevision: Int = -1
 )
 
-data class NavigationCapabilities(val maxWaypoints: Int = 3, val travelModes: Set<TravelMode> = setOf(TravelMode.DRIVE))
+data class NavigationCapabilities(val maxWaypoints: Int = DEFAULT_MAX_WAYPOINTS, val travelModes: Set<TravelMode> = setOf(TravelMode.DRIVE)) {
+    companion object { const val DEFAULT_MAX_WAYPOINTS = 10 }
+}

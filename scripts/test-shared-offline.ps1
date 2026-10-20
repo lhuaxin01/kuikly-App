@@ -50,5 +50,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Shared Kotlin type-check failed.' }
     com.example.navi_app.navigation.NavigationAgentTest `
     com.example.navi_app.navigation.AccountPresentationTest `
     com.example.navi_app.navigation.SessionPresentationTest `
-    com.example.navi_app.navigation.SessionCoordinatorTest
+    com.example.navi_app.navigation.SessionCoordinatorTest `
+    com.example.navi_app.navigation.VoiceInputTest `
+    com.example.navi_app.navigation.NavigationVoiceLexiconTest
 if ($LASTEXITCODE -ne 0) { throw 'Shared business tests failed.' }
